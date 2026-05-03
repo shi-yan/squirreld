@@ -11,6 +11,7 @@ use crate::{
     db::records::RecordRow,
     error::{Result, SquirrelError},
     hlc::Hlc,
+    sync::SyncTrigger,
     types::*,
 };
 
@@ -48,6 +49,9 @@ enum Command {
         seq: i64,
         reply: oneshot::Sender<Result<()>>,
     },
+    ForceSync {
+        reply: oneshot::Sender<Result<SyncStats>>,
+    },
     Shutdown,
 }
 
@@ -61,8 +65,10 @@ struct ActorState {
     last_hlc: Hlc,
     /// Collection configs keyed by name. Used in later phases for indexing/encryption.
     _collections: HashMap<String, CollectionConfig>,
-    /// Broadcast sender for sync lifecycle events (used in Phase 2+).
+    /// Broadcast sender for sync lifecycle events.
     _events_tx: broadcast::Sender<SyncEvent>,
+    /// Send a trigger to the sync loop after every write. None when no backend is configured.
+    sync_trigger: Option<mpsc::Sender<SyncTrigger>>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -101,11 +107,28 @@ impl SquirrelEngine {
         let (events_tx, _) = broadcast::channel(64);
         let (tx, rx) = mpsc::channel(config.channel_capacity);
 
+        // Optionally start the sync loop.
+        let sync_trigger = if let Some(backend) = config.record_backend {
+            let (trigger_tx, trigger_rx) = mpsc::channel(8);
+            let sync_loop = crate::sync::SyncLoop::new(
+                config.db_path.clone(),
+                node_id,
+                backend,
+                events_tx.clone(),
+                trigger_rx,
+            );
+            tokio::spawn(sync_loop.run());
+            Some(trigger_tx)
+        } else {
+            None
+        };
+
         let state = ActorState {
             conn,
             last_hlc,
             _collections: config.collections,
             _events_tx: events_tx.clone(),
+            sync_trigger,
         };
 
         tokio::spawn(actor_loop(rx, state));
@@ -169,6 +192,14 @@ impl SquirrelEngine {
         rx.await.map_err(|_| SquirrelError::ActorClosed)?
     }
 
+    /// Trigger an immediate sync cycle and wait for it to complete.
+    /// Returns `Ok(SyncStats::default())` if no backend is configured.
+    pub async fn force_sync(&self) -> Result<SyncStats> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::ForceSync { reply: tx }).await?;
+        rx.await.map_err(|_| SquirrelError::ActorClosed)?
+    }
+
     /// Subscribe to sync lifecycle events. Returns a broadcast receiver; multiple
     /// subscribers are supported.
     pub fn sync_events(&self) -> broadcast::Receiver<SyncEvent> {
@@ -199,13 +230,21 @@ async fn actor_loop(mut rx: mpsc::Receiver<Command>, mut state: ActorState) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Command::Put { collection, id, data, opts, reply } => {
-                let _ = reply.send(handle_put(&mut state, collection, id, data, opts));
+                let result = handle_put(&mut state, collection, id, data, opts);
+                if result.is_ok() {
+                    kick_sync(&state);
+                }
+                let _ = reply.send(result);
             }
             Command::Get { collection, id, reply } => {
                 let _ = reply.send(handle_get(&state, &collection, id));
             }
             Command::Delete { collection, id, reply } => {
-                let _ = reply.send(handle_delete(&mut state, &collection, id));
+                let result = handle_delete(&mut state, &collection, id);
+                if result.is_ok() {
+                    kick_sync(&state);
+                }
+                let _ = reply.send(result);
             }
             Command::List { collection, opts, reply } => {
                 let _ = reply.send(handle_list(&state, &collection, opts));
@@ -216,14 +255,27 @@ async fn actor_loop(mut rx: mpsc::Receiver<Command>, mut state: ActorState) {
             Command::ClearError { seq, reply } => {
                 let _ = reply.send(db::outbox::clear_error(&state.conn, seq));
             }
+            Command::ForceSync { reply } => {
+                // Clone the sender before awaiting so no &state borrow crosses an .await.
+                let trigger = state.sync_trigger.clone();
+                let _ = reply.send(force_sync_via(trigger).await);
+            }
             Command::Shutdown => break,
         }
     }
     tracing::debug!("squirreld actor shut down");
 }
 
+/// Non-blocking: fire-and-forget sync trigger. Drops silently if the channel is
+/// full (the sync loop is already running or about to run).
+fn kick_sync(state: &ActorState) {
+    if let Some(tx) = &state.sync_trigger {
+        let _ = tx.try_send(SyncTrigger::Kick);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
-// Command handlers (all synchronous — no .await inside)
+// Command handlers
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn handle_put(
@@ -301,6 +353,19 @@ fn handle_pending_errors(state: &ActorState) -> Result<Vec<PendingError>> {
             })
             .collect()
     })
+}
+
+/// Sends a ForceSync trigger and waits for the sync loop to reply.
+/// Takes an owned sender (not &ActorState) so no non-Send value crosses an .await.
+async fn force_sync_via(trigger: Option<mpsc::Sender<SyncTrigger>>) -> Result<SyncStats> {
+    match trigger {
+        None => Ok(SyncStats::default()),
+        Some(tx) => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = tx.send(SyncTrigger::ForceSync(reply_tx)).await;
+            reply_rx.await.map_err(|_| SquirrelError::ActorClosed)
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
