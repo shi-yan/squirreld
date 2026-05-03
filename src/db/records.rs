@@ -146,6 +146,10 @@ pub fn max_hlc(conn: &Connection) -> Result<Option<String>> {
         .map_err(Into::into)
 }
 
+pub(crate) fn from_row_pub(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecordRow> {
+    from_row(r)
+}
+
 fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecordRow> {
     Ok(RecordRow {
         id:             r.get(0)?,

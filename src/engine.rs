@@ -10,7 +10,7 @@ use crate::{
     builder::EngineConfig,
     collection::CollectionConfig,
     db,
-    db::records::RecordRow,
+    db::{index::QueryOpts, records::RecordRow},
     error::{Result, SquirrelError},
     hlc::Hlc,
     sync::SyncTrigger,
@@ -71,6 +71,16 @@ enum Command {
     ForceFlushBlobs {
         reply: oneshot::Sender<Result<()>>,
     },
+    // ── Index commands ──────────────────────────────────────────────────────
+    RegisterIndex {
+        def: IndexDef,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Query {
+        collection: String,
+        opts: QueryOpts,
+        reply: oneshot::Sender<Result<Vec<RecordMeta>>>,
+    },
     Shutdown,
 }
 
@@ -86,6 +96,8 @@ struct ActorState {
     sync_trigger: Option<mpsc::Sender<SyncTrigger>>,
     blob_trigger: Option<mpsc::Sender<BlobTrigger>>,
     cache_dir: PathBuf,
+    /// Shadow indexes keyed by collection name.
+    indexes: HashMap<String, IndexDef>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -163,6 +175,7 @@ impl SquirrelEngine {
             sync_trigger,
             blob_trigger,
             cache_dir,
+            indexes: HashMap::new(),
         };
 
         tokio::spawn(actor_loop(rx, state));
@@ -258,6 +271,25 @@ impl SquirrelEngine {
         rx.await.map_err(|_| SquirrelError::ActorClosed)?
     }
 
+    // ── Index operations ────────────────────────────────────────────────────
+
+    /// Register a shadow index for a collection.
+    /// Creates the backing SQLite tables and records the definition so that
+    /// subsequent `put` calls automatically maintain the index.
+    pub async fn register_index(&self, def: IndexDef) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::RegisterIndex { def, reply: tx }).await?;
+        rx.await.map_err(|_| SquirrelError::ActorClosed)?
+    }
+
+    /// Query a collection using an optional filter and sort/page options.
+    /// Returns record headers (no data bytes); call `get` for the full payload.
+    pub async fn query(&self, collection: &str, opts: QueryOpts) -> Result<Vec<RecordMeta>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::Query { collection: collection.into(), opts, reply: tx }).await?;
+        rx.await.map_err(|_| SquirrelError::ActorClosed)?
+    }
+
     // ── Events ──────────────────────────────────────────────────────────────
 
     pub fn sync_events(&self) -> broadcast::Receiver<SyncEvent> {
@@ -322,6 +354,12 @@ async fn actor_loop(mut rx: mpsc::Receiver<Command>, mut state: ActorState) {
                 let trigger = state.blob_trigger.clone();
                 let _ = reply.send(force_flush_blobs_via(trigger).await);
             }
+            Command::RegisterIndex { def, reply } => {
+                let _ = reply.send(handle_register_index(&mut state, def));
+            }
+            Command::Query { collection, opts, reply } => {
+                let _ = reply.send(handle_query(&state, &collection, opts));
+            }
             Command::Shutdown => break,
         }
     }
@@ -364,6 +402,17 @@ fn handle_put(
         updated_at:     now,
     })?;
     db::outbox::append(&tx, &id.to_string(), &collection, "upsert", &hlc.to_string(), Some(&data))?;
+
+    // Maintain shadow index if registered for this collection.
+    if let Some(def) = state.indexes.get(&collection) {
+        if !opts.index_fields.is_empty() || !def.fields.is_empty() {
+            db::index::upsert_index_row(&tx, def, &id.to_string(), &opts.index_fields)?;
+        }
+        if !def.fts_fields.is_empty() {
+            db::index::upsert_fts_row(&tx, def, &id.to_string(), &opts.index_fields)?;
+        }
+    }
+
     tx.commit()?;
     state.last_hlc = hlc;
     Ok(id)
@@ -380,6 +429,11 @@ fn handle_delete(state: &mut ActorState, collection: &str, id: Ulid) -> Result<(
     let tx  = state.conn.transaction()?;
     db::records::soft_delete(&tx, collection, &id.to_string(), &hlc.to_string(), now)?;
     db::outbox::append(&tx, &id.to_string(), collection, "delete", &hlc.to_string(), None)?;
+
+    if let Some(def) = state.indexes.get(collection) {
+        db::index::delete_index_rows(&tx, def, &id.to_string())?;
+    }
+
     tx.commit()?;
     state.last_hlc = hlc;
     Ok(())
@@ -503,6 +557,23 @@ async fn force_flush_blobs_via(trigger: Option<mpsc::Sender<BlobTrigger>>) -> Re
             reply_rx.await.map_err(|_| SquirrelError::ActorClosed)
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Index handlers
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn handle_register_index(state: &mut ActorState, def: IndexDef) -> Result<()> {
+    db::index::create_shadow_table(&state.conn, &def)?;
+    db::index::create_fts_table(&state.conn, &def)?;
+    state.indexes.insert(def.collection.clone(), def);
+    Ok(())
+}
+
+fn handle_query(state: &ActorState, collection: &str, opts: QueryOpts) -> Result<Vec<RecordMeta>> {
+    let def = state.indexes.get(collection);
+    db::index::query(&state.conn, collection, def, &opts)
+        .map(|rows| rows.into_iter().map(to_meta).collect())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

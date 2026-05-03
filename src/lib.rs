@@ -12,10 +12,12 @@ pub(crate) mod sync;
 pub mod backend;
 
 pub use builder::EngineBuilder;
+pub use db::index::QueryOpts;
 pub use engine::SquirrelEngine;
 pub use hlc::Hlc;
 pub use types::{
-    BlobId, BlobInfo, BlobStatus, ItemEncryption, ListOpts, PendingError, PutBlobOpts, PutOpts,
+    BlobId, BlobInfo, BlobStatus, ColumnAffinity, FieldDef, IndexDef, IndexValue,
+    ItemEncryption, ListOpts, PendingError, PutBlobOpts, PutOpts, QueryFilter,
     Record, RecordMeta, SortOrder, SyncEvent, SyncStats, Ulid,
 };
 

@@ -38,6 +38,9 @@ pub struct RecordMeta {
 pub struct PutOpts {
     pub encryption: ItemEncryption,
     pub schema_version: Option<u32>,
+    /// Values to write into the shadow index for this record.
+    /// Keys must match field names declared in [`IndexDef::fields`] or [`IndexDef::fts_fields`].
+    pub index_fields: std::collections::HashMap<String, IndexValue>,
 }
 
 /// Per-item encryption override. Resolved as: item > collection > engine.
@@ -171,6 +174,64 @@ pub struct PendingError {
     pub last_error: Option<String>,
     /// Unix ms timestamp of the next scheduled retry attempt.
     pub next_retry_at_ms: u64,
+}
+
+// ── Index types ───────────────────────────────────────────────────────────────
+
+/// Declares which fields of a collection to index for fast querying.
+#[derive(Debug, Clone)]
+pub struct IndexDef {
+    pub collection: String,
+    /// Scalar fields stored in the shadow index table.
+    pub fields: Vec<FieldDef>,
+    /// Fields to include in the FTS5 full-text index (must be text).
+    pub fts_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldDef {
+    pub name: String,
+    pub affinity: ColumnAffinity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnAffinity {
+    Text,
+    Integer,
+    Real,
+}
+
+impl ColumnAffinity {
+    pub(crate) fn as_sql_type(self) -> &'static str {
+        match self {
+            Self::Text    => "TEXT",
+            Self::Integer => "INTEGER",
+            Self::Real    => "REAL",
+        }
+    }
+}
+
+/// A typed value for a shadow-index field, supplied at [`crate::SquirrelEngine::put`] time.
+#[derive(Debug, Clone)]
+pub enum IndexValue {
+    Text(String),
+    Integer(i64),
+    Real(f64),
+    Null,
+}
+
+/// A filter expression used by [`crate::SquirrelEngine::query`].
+#[derive(Debug, Clone)]
+pub enum QueryFilter {
+    Eq      { field: String, value: IndexValue },
+    Lt      { field: String, value: IndexValue },
+    Gt      { field: String, value: IndexValue },
+    Le      { field: String, value: IndexValue },
+    Ge      { field: String, value: IndexValue },
+    /// Full-text search across all FTS-indexed fields for this collection.
+    Contains { text: String },
+    And(Vec<QueryFilter>),
+    Or(Vec<QueryFilter>),
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
