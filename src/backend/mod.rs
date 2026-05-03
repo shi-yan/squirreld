@@ -22,9 +22,13 @@ pub struct OutboxPushEntry {
     /// "upsert" or "delete"
     pub operation: String,
     pub hlc: String,
-    /// Raw bytes (present for upserts, None for deletes).
+    /// Raw payload bytes (ciphertext when `format_version=1`, plaintext otherwise).
+    /// None for delete tombstones.
     pub data: Option<Vec<u8>>,
+    /// Wrapped Data Encryption Key. Present only when `format_version=1`.
+    pub dek_encrypted: Option<Vec<u8>>,
     pub schema_version: u32,
+    /// 0 = plaintext, 1 = AES-256-GCM encrypted.
     pub format_version: u8,
     pub retries: u32,
 }
@@ -35,10 +39,14 @@ pub struct RemoteRecord {
     pub record_id: String,
     pub collection: String,
     pub hlc: String,
-    /// None means the record was deleted (tombstone).
+    /// Raw payload bytes (ciphertext when `format_version=1`, plaintext otherwise).
+    /// None for delete tombstones.
     pub data: Option<Vec<u8>>,
+    /// Wrapped DEK; present only when `format_version=1`.
+    pub dek_encrypted: Option<Vec<u8>>,
     pub deleted: bool,
     pub schema_version: u32,
+    /// 0 = plaintext, 1 = AES-256-GCM encrypted.
     pub format_version: u8,
 }
 

@@ -71,6 +71,9 @@ impl DynamoDbBackend {
         if let Some(data) = &entry.data {
             item.insert("data".into(), Self::av_b(data.clone()));
         }
+        if let Some(dek) = &entry.dek_encrypted {
+            item.insert("dek_encrypted".into(), Self::av_b(dek.clone()));
+        }
         item
     }
 
@@ -95,7 +98,10 @@ impl DynamoDbBackend {
         let data = item.get("data")
             .and_then(|v| v.as_b().ok())
             .map(|b| b.clone().into_inner());
-        Some(RemoteRecord { record_id, collection, hlc, data, deleted, schema_version, format_version })
+        let dek_encrypted = item.get("dek_encrypted")
+            .and_then(|v| v.as_b().ok())
+            .map(|b| b.clone().into_inner());
+        Some(RemoteRecord { record_id, collection, hlc, data, dek_encrypted, deleted, schema_version, format_version })
     }
 }
 

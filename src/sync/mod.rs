@@ -244,25 +244,26 @@ impl SyncLoop {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn build_push_entry(conn: &Connection, entry: &OutboxEntry) -> Option<OutboxPushEntry> {
-    let schema_version = if entry.operation == "delete" {
-        0u32
+    let (data, dek_encrypted, schema_version, format_version) = if entry.operation == "delete" {
+        (None, None, 0u32, 0u8)
     } else {
         let row = db::records::get(conn, &entry.collection, &entry.record_id).ok()??;
-        row.schema_version
+        // Read the stored (possibly encrypted) bytes directly from the records table
+        // so the remote backend never receives plaintext when encryption is enabled.
+        (Some(row.data), row.dek_encrypted, row.schema_version, row.format_version)
     };
 
     Some(OutboxPushEntry {
-        seq:            entry.seq,
-        record_id:      entry.record_id.clone(),
-        collection:     entry.collection.clone(),
-        operation:      entry.operation.clone(),
-        hlc:            entry.hlc.clone(),
-        data:           entry.data.clone(),
+        seq:           entry.seq,
+        record_id:     entry.record_id.clone(),
+        collection:    entry.collection.clone(),
+        operation:     entry.operation.clone(),
+        hlc:           entry.hlc.clone(),
+        data,
+        dek_encrypted,
         schema_version,
-        // Outbox data is always the original plaintext the caller supplied.
-        // Peers store it as format_version=0 and apply their own encryption policy.
-        format_version: 0,
-        retries:        entry.retries,
+        format_version,
+        retries:       entry.retries,
     })
 }
 
@@ -288,7 +289,7 @@ fn apply_remote_record(
         hlc:            remote.hlc.clone(),
         schema_version: remote.schema_version,
         format_version: remote.format_version,
-        dek_encrypted:  None,
+        dek_encrypted:  remote.dek_encrypted.clone(),
         deleted:        remote.deleted,
         synced:         true,
         created_at,

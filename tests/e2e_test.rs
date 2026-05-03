@@ -245,6 +245,49 @@ async fn encrypted_records_sync_correctly() {
     assert_eq!(rec.data, b"encrypted content", "B must decrypt synced record");
 }
 
+// ── Server never sees plaintext (E2E encryption guarantee) ───────────────────
+
+#[tokio::test]
+async fn server_stores_ciphertext_not_plaintext() {
+    let dir_a = tempdir().unwrap();
+    let store = InMemoryStore::new_shared();
+    let blobs = InMemoryBlobStore::new_shared();
+
+    let plaintext = b"top secret content";
+
+    let a = {
+        let rb = Arc::new(InMemoryBackend::new("a", store.clone()));
+        let bb = Arc::new(InMemoryBlobBackend::new("a", blobs.clone()));
+        SquirrelEngine::builder()
+            .db_path(dir_a.path().join("a.db"))
+            .cache_dir(dir_a.path().join("a_blobs"))
+            .record_backend(rb)
+            .blob_backend(bb)
+            .encryption_key(KeySource::RawKey([0xAAu8; 32]))
+            .build()
+            .await
+            .unwrap()
+    };
+
+    a.put("secrets", None, plaintext.to_vec(), PutOpts::default()).await.unwrap();
+    a.force_sync().await.unwrap();
+
+    // Inspect the raw bytes stored in the shared "remote" InMemoryStore.
+    let guard = store.lock().await;
+    let remote = guard.records.values().next()
+        .expect("backend must have received the pushed record");
+
+    // The raw data blob in the store must not contain the plaintext.
+    let stored_bytes = remote.data.as_deref().unwrap_or(&[]);
+    assert!(
+        !stored_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+        "server-side data must be ciphertext, not plaintext"
+    );
+    // The wrapped DEK must be present so peers can decrypt.
+    assert!(remote.dek_encrypted.is_some(), "server must store the wrapped DEK");
+    assert_eq!(remote.format_version, 1, "format_version must be 1 for encrypted records");
+}
+
 // ── Blob sync between two devices ─────────────────────────────────────────────
 
 #[tokio::test]

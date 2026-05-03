@@ -15,7 +15,7 @@ use crate::backend::{
 /// Shared remote state underlying one or more [`InMemoryBackend`] instances.
 pub struct InMemoryStore {
     /// (record_id, collection) → RemoteRecord
-    records: HashMap<(String, String), RemoteRecord>,
+    pub records: HashMap<(String, String), RemoteRecord>,
 }
 
 impl InMemoryStore {
@@ -70,6 +70,7 @@ impl RecordBackend for InMemoryBackend {
             collection:     entry.collection.clone(),
             hlc:            entry.hlc.clone(),
             data:           entry.data.clone(),
+            dek_encrypted:  entry.dek_encrypted.clone(),
             deleted:        entry.operation == "delete",
             schema_version: entry.schema_version,
             format_version: entry.format_version,
