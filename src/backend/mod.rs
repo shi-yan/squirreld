@@ -1,12 +1,17 @@
+use std::path::Path;
+
 use async_trait::async_trait;
 
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 
+#[cfg(feature = "s3")]
+pub mod s3;
+
 #[cfg(feature = "test-utils")]
 pub mod in_memory;
 
-// ── Wire types ────────────────────────────────────────────────────────────────
+// ── Record backend wire types ──────────────────────────────────────────────────
 
 /// A single outbox entry ready to be pushed to the remote backend.
 #[derive(Debug, Clone)]
@@ -40,7 +45,7 @@ pub struct RemoteRecord {
 /// Result of a single push attempt.
 #[derive(Debug)]
 pub enum PushResult {
-    /// All entries in the batch were accepted.
+    /// Entry was accepted by the remote.
     Ok { pushed_seqs: Vec<i64> },
     /// The remote has a higher (or equal) HLC for this record; a pull is needed.
     ConflictAt { record_id: String, seq: i64 },
@@ -48,7 +53,7 @@ pub enum PushResult {
     TransientError(String),
 }
 
-/// Error type returned by pull operations.
+/// Error type returned by backend operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     #[error("transient: {0}")]
@@ -57,30 +62,89 @@ pub enum BackendError {
     Config(String),
 }
 
-// ── Trait ─────────────────────────────────────────────────────────────────────
+// ── RecordBackend trait ────────────────────────────────────────────────────────
 
-/// Abstraction over a remote record store. Implement this to use a different
-/// backend (e.g. a local test double, a custom HTTP API, etc.).
+/// Abstraction over a remote record store.
 #[async_trait]
 pub trait RecordBackend: Send + Sync + 'static {
-    /// A stable identifier used as the backend key in `sync_state`.
     fn backend_id(&self) -> &str;
 
-    /// Push a single outbox entry to the remote. The backend MUST enforce the
-    /// LWW condition: only accept the write if `attribute_not_exists(hlc) OR
-    /// hlc < :incoming_hlc`. Returns [`PushResult::ConflictAt`] if the remote
-    /// already has a newer record.
     async fn push_one(&self, entry: &OutboxPushEntry) -> PushResult;
 
-    /// Return all records whose HLC is strictly greater than `checkpoint`.
-    /// Pass `None` to fetch everything. Results MUST be sorted by HLC ascending
-    /// so the caller can advance the checkpoint incrementally.
+    /// Return all records with HLC > `checkpoint`. Pass `None` for all records.
+    /// Results MUST be sorted by HLC ascending.
     async fn pull_since(
         &self,
         checkpoint: Option<&str>,
     ) -> Result<Vec<RemoteRecord>, BackendError>;
 
-    /// Create the backend table / bucket if it does not already exist.
-    /// Called once during engine startup. Must be idempotent.
+    /// Create the backing table/index if absent. Idempotent.
     async fn ensure_table(&self) -> Result<(), BackendError>;
+}
+
+// ── Blob backend wire types ────────────────────────────────────────────────────
+
+/// A part that has already been uploaded to a multipart session.
+#[derive(Debug, Clone)]
+pub struct UploadedPart {
+    pub part_number: i32,
+    pub etag: String,
+}
+
+// ── BlobBackend trait ─────────────────────────────────────────────────────────
+
+/// Abstraction over a remote blob / object store.
+///
+/// Upload flow for large blobs (≥ `MULTIPART_THRESHOLD`):
+/// 1. `create_multipart_upload` → `upload_id`
+/// 2. `upload_part` × N → ETags stored locally
+/// 3. `complete_multipart_upload` with all parts
+///
+/// Resume flow (engine restart mid-upload):
+/// 1. `list_parts` → discover already-uploaded parts
+/// 2. Upload only the missing parts
+/// 3. `complete_multipart_upload`
+#[async_trait]
+pub trait BlobBackend: Send + Sync + 'static {
+    fn backend_id(&self) -> &str;
+
+    /// Create the bucket/container if it does not already exist. Idempotent.
+    async fn ensure_bucket(&self) -> Result<(), BackendError>;
+
+    /// Upload a small blob (< `MULTIPART_THRESHOLD`) in a single request.
+    async fn put_object(&self, key: &str, data: Vec<u8>) -> Result<(), BackendError>;
+
+    /// Initiate a multipart upload session. Returns the `upload_id`.
+    async fn create_multipart_upload(&self, key: &str) -> Result<String, BackendError>;
+
+    /// Upload one part of a multipart upload. Returns the ETag for this part.
+    async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: Vec<u8>,
+    ) -> Result<String, BackendError>;
+
+    /// List parts that have already been uploaded for a given multipart session.
+    /// Returns an empty Vec (not an error) if the upload_id has expired.
+    async fn list_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<UploadedPart>, BackendError>;
+
+    /// Finalise a multipart upload. `parts` must be sorted by part_number ascending.
+    async fn complete_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<UploadedPart>,
+    ) -> Result<(), BackendError>;
+
+    /// Download an object and write it to `dest`. Returns the number of bytes written.
+    async fn get_object(&self, key: &str, dest: &Path) -> Result<u64, BackendError>;
+
+    /// Delete an object. No-op if the object does not exist.
+    async fn delete_object(&self, key: &str) -> Result<(), BackendError>;
 }

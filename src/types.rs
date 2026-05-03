@@ -1,8 +1,11 @@
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use ulid::Ulid;
 
 use crate::hlc::Hlc;
+
+// ── Record types ──────────────────────────────────────────────────────────────
 
 /// A record returned by [`crate::SquirrelEngine::get`] — includes the full data payload.
 #[derive(Debug, Clone)]
@@ -76,6 +79,67 @@ pub enum SortOrder {
     HlcAsc,
 }
 
+// ── Blob types ────────────────────────────────────────────────────────────────
+
+/// Opaque identifier for a staged/uploaded blob (a ULID string).
+pub type BlobId = String;
+
+/// Lifecycle state of a blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobStatus {
+    /// Staged locally, waiting to be uploaded to the remote.
+    Pending,
+    /// Upload is in progress (upload_id obtained, parts being sent).
+    Uploading,
+    /// Upload complete — the blob lives on the remote backend.
+    Uploaded,
+    /// Blob is available in the local cache (downloaded from remote).
+    Cached,
+}
+
+impl BlobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending   => "pending",
+            Self::Uploading => "uploading",
+            Self::Uploaded  => "uploaded",
+            Self::Cached    => "cached",
+        }
+    }
+
+    pub(crate) fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "pending"   => Some(Self::Pending),
+            "uploading" => Some(Self::Uploading),
+            "uploaded"  => Some(Self::Uploaded),
+            "cached"    => Some(Self::Cached),
+            _           => None,
+        }
+    }
+}
+
+/// Information about a blob returned by [`crate::SquirrelEngine::blob_info`].
+#[derive(Debug, Clone)]
+pub struct BlobInfo {
+    pub id: BlobId,
+    pub status: BlobStatus,
+    /// Absolute path to the locally cached file, if available.
+    pub local_path: Option<PathBuf>,
+    pub size_bytes: Option<u64>,
+    pub retries: u32,
+    pub last_error: Option<String>,
+}
+
+/// Options for [`crate::SquirrelEngine::put_blob`].
+#[derive(Debug, Clone, Default)]
+pub struct PutBlobOpts {
+    /// Associate this blob with a specific record.
+    pub record_id: Option<String>,
+    pub collection: Option<String>,
+}
+
+// ── Sync types ────────────────────────────────────────────────────────────────
+
 /// Summary of a completed sync cycle.
 #[derive(Debug, Clone, Default)]
 pub struct SyncStats {
@@ -85,13 +149,15 @@ pub struct SyncStats {
     pub errors: usize,
 }
 
-/// Events emitted by the sync engine. Subscribe via [`crate::SquirrelEngine::sync_events`].
+/// Events emitted by the sync/blob engine. Subscribe via [`crate::SquirrelEngine::sync_events`].
 #[derive(Debug, Clone)]
 pub enum SyncEvent {
     PushComplete(SyncStats),
     PullComplete(SyncStats),
-    BlobUploaded { blob_id: String },
+    BlobUploaded { blob_id: BlobId },
+    BlobDownloaded { blob_id: BlobId },
     RetryScheduled { seq: i64, retries: u32, next_retry_ms: u64, error: String },
+    BlobRetryScheduled { blob_id: BlobId, retries: u32, next_retry_ms: u64, error: String },
 }
 
 /// An outbox entry that has experienced at least one failed sync attempt.
@@ -106,6 +172,8 @@ pub struct PendingError {
     /// Unix ms timestamp of the next scheduled retry attempt.
     pub next_retry_at_ms: u64,
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Current millisecond unix timestamp as i64 (matches SQLite INTEGER storage).
 pub(crate) fn now_ms() -> i64 {

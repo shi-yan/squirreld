@@ -1,3 +1,4 @@
+pub mod blobs;
 pub mod config;
 pub mod outbox;
 pub mod records;

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
-    backend::RecordBackend,
+    backend::{BlobBackend, RecordBackend},
     collection::CollectionConfig,
     engine::SquirrelEngine,
     error::{Result, SquirrelError},
@@ -11,11 +11,15 @@ use crate::{
 
 /// Validated engine configuration produced by [`EngineBuilder::build`].
 pub struct EngineConfig {
-    pub(crate) db_path: PathBuf,
-    pub(crate) collections: HashMap<String, CollectionConfig>,
+    pub(crate) db_path:          PathBuf,
+    pub(crate) collections:      HashMap<String, CollectionConfig>,
     pub(crate) channel_capacity: usize,
-    /// Optional sync backend. When set, the sync loop is started automatically.
-    pub(crate) record_backend: Option<Arc<dyn RecordBackend>>,
+    /// Optional record sync backend.
+    pub(crate) record_backend:   Option<Arc<dyn RecordBackend>>,
+    /// Optional blob store backend.
+    pub(crate) blob_backend:     Option<Arc<dyn BlobBackend>>,
+    /// Directory for locally cached blob files (default: `{db_dir}/blob_cache`).
+    pub(crate) cache_dir:        Option<PathBuf>,
 }
 
 /// Fluent builder for [`SquirrelEngine`].
@@ -31,27 +35,29 @@ pub struct EngineConfig {
 /// # Ok(()) }
 /// ```
 pub struct EngineBuilder {
-    db_path: Option<PathBuf>,
-    collections: HashMap<String, CollectionConfig>,
+    db_path:          Option<PathBuf>,
+    collections:      HashMap<String, CollectionConfig>,
     channel_capacity: usize,
-    record_backend: Option<Arc<dyn RecordBackend>>,
+    record_backend:   Option<Arc<dyn RecordBackend>>,
+    blob_backend:     Option<Arc<dyn BlobBackend>>,
+    cache_dir:        Option<PathBuf>,
 }
 
 impl Default for EngineBuilder {
     fn default() -> Self {
         Self {
-            db_path: None,
-            collections: HashMap::new(),
+            db_path:          None,
+            collections:      HashMap::new(),
             channel_capacity: 256,
-            record_backend: None,
+            record_backend:   None,
+            blob_backend:     None,
+            cache_dir:        None,
         }
     }
 }
 
 impl EngineBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     /// Path to the SQLite database file. Required.
     pub fn db_path(mut self, path: impl Into<PathBuf>) -> Self {
@@ -59,23 +65,34 @@ impl EngineBuilder {
         self
     }
 
-    /// Register a collection. Can be called multiple times for different collections.
+    /// Register a collection.
     pub fn collection(mut self, name: impl Into<String>, config: CollectionConfig) -> Self {
         self.collections.insert(name.into(), config);
         self
     }
 
-    /// Capacity of the internal command channel (default: 256).
-    /// Provides backpressure: callers block if the actor falls behind.
+    /// Internal command channel capacity (default: 256).
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
         self
     }
 
-    /// Attach a sync backend. When set, the engine starts pushing local writes
-    /// to the remote and pulling remote changes automatically.
+    /// Attach a record sync backend (DynamoDB or in-memory test double).
     pub fn record_backend(mut self, backend: Arc<dyn RecordBackend>) -> Self {
         self.record_backend = Some(backend);
+        self
+    }
+
+    /// Attach a blob store backend (S3 or in-memory test double).
+    /// Also requires `db_path` so the engine can compute a default `cache_dir`.
+    pub fn blob_backend(mut self, backend: Arc<dyn BlobBackend>) -> Self {
+        self.blob_backend = Some(backend);
+        self
+    }
+
+    /// Override the local blob cache directory (default: `{db_dir}/blob_cache`).
+    pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = Some(dir.into());
         self
     }
 
@@ -85,10 +102,12 @@ impl EngineBuilder {
             SquirrelError::Other("db_path is required — call .db_path() on the builder".into())
         })?;
         let config = EngineConfig {
-            db_path,
+            cache_dir: self.cache_dir,
             collections: self.collections,
             channel_capacity: self.channel_capacity,
             record_backend: self.record_backend,
+            blob_backend: self.blob_backend,
+            db_path,
         };
         SquirrelEngine::open(config).await
     }
