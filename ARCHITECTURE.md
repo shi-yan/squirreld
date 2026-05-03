@@ -407,8 +407,20 @@ pub struct DynamoDbConfig {
     pub table_name: String,    // app-specific, e.g. "unfolded_records"
     pub region: String,
     pub user_id: String,       // used in S3 key prefix; not in DynamoDB keys
+    pub credentials: AwsCredentials,
+}
+
+pub enum AwsCredentials {
+    /// Read from ~/.aws/credentials or ~/.aws/config (profile name optional).
+    /// Also accepts AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars.
+    /// This is the default and covers the developer's local machine.
+    FromEnvironment { profile: Option<String> },
+    /// Explicit credentials supplied by the application layer.
+    Explicit { access_key_id: String, secret_access_key: String, session_token: Option<String> },
 }
 ```
+
+Credential resolution order for `FromEnvironment`: environment variables → AWS config file → instance metadata (EC2/ECS). The `aws-config` crate handles this automatically when `AwsCredentials::FromEnvironment` is used.
 
 The `ensure_table` method creates the table and GSI on first run (idempotent). Required IAM permissions: `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:DeleteItem`, `dynamodb:TransactWriteItems`, `dynamodb:Query` (on the GSI).
 
