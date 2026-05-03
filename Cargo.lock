@@ -2318,6 +2318,7 @@ name = "squirreld"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "argon2",
  "async-trait",
  "aws-config",
@@ -2327,6 +2328,7 @@ dependencies = [
  "aws-smithy-types",
  "rand 0.8.6",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

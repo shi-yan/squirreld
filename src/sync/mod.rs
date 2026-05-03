@@ -244,11 +244,11 @@ impl SyncLoop {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn build_push_entry(conn: &Connection, entry: &OutboxEntry) -> Option<OutboxPushEntry> {
-    let (schema_version, format_version) = if entry.operation == "delete" {
-        (0u32, 0u8)
+    let schema_version = if entry.operation == "delete" {
+        0u32
     } else {
         let row = db::records::get(conn, &entry.collection, &entry.record_id).ok()??;
-        (row.schema_version, row.format_version)
+        row.schema_version
     };
 
     Some(OutboxPushEntry {
@@ -259,7 +259,9 @@ fn build_push_entry(conn: &Connection, entry: &OutboxEntry) -> Option<OutboxPush
         hlc:            entry.hlc.clone(),
         data:           entry.data.clone(),
         schema_version,
-        format_version,
+        // Outbox data is always the original plaintext the caller supplied.
+        // Peers store it as format_version=0 and apply their own encryption policy.
+        format_version: 0,
         retries:        entry.retries,
     })
 }
