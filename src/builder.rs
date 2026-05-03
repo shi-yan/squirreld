@@ -7,6 +7,7 @@ use crate::{
     collection::CollectionConfig,
     engine::SquirrelEngine,
     error::{Result, SquirrelError},
+    types::KeySource,
 };
 
 /// Validated engine configuration produced by [`EngineBuilder::build`].
@@ -20,6 +21,8 @@ pub struct EngineConfig {
     pub(crate) blob_backend:     Option<Arc<dyn BlobBackend>>,
     /// Directory for locally cached blob files (default: `{db_dir}/blob_cache`).
     pub(crate) cache_dir:        Option<PathBuf>,
+    /// Source of the Key Encryption Key. `None` means encryption is disabled.
+    pub(crate) encryption_key:   Option<KeySource>,
 }
 
 /// Fluent builder for [`SquirrelEngine`].
@@ -41,6 +44,7 @@ pub struct EngineBuilder {
     record_backend:   Option<Arc<dyn RecordBackend>>,
     blob_backend:     Option<Arc<dyn BlobBackend>>,
     cache_dir:        Option<PathBuf>,
+    encryption_key:   Option<KeySource>,
 }
 
 impl Default for EngineBuilder {
@@ -52,6 +56,7 @@ impl Default for EngineBuilder {
             record_backend:   None,
             blob_backend:     None,
             cache_dir:        None,
+            encryption_key:   None,
         }
     }
 }
@@ -96,17 +101,25 @@ impl EngineBuilder {
         self
     }
 
+    /// Enable at-rest encryption with AES-256-GCM.
+    /// Provide a [`KeySource`] to supply or derive the Key Encryption Key.
+    pub fn encryption_key(mut self, source: KeySource) -> Self {
+        self.encryption_key = Some(source);
+        self
+    }
+
     /// Validate configuration and open the engine.
     pub async fn build(self) -> Result<SquirrelEngine> {
         let db_path = self.db_path.ok_or_else(|| {
             SquirrelError::Other("db_path is required — call .db_path() on the builder".into())
         })?;
         let config = EngineConfig {
-            cache_dir: self.cache_dir,
-            collections: self.collections,
+            cache_dir:      self.cache_dir,
+            collections:    self.collections,
             channel_capacity: self.channel_capacity,
             record_backend: self.record_backend,
-            blob_backend: self.blob_backend,
+            blob_backend:   self.blob_backend,
+            encryption_key: self.encryption_key,
             db_path,
         };
         SquirrelEngine::open(config).await

@@ -98,6 +98,8 @@ struct ActorState {
     cache_dir: PathBuf,
     /// Shadow indexes keyed by collection name.
     indexes: HashMap<String, IndexDef>,
+    /// In-memory Key Encryption Key. `None` means encryption is disabled.
+    kek: Option<[u8; 32]>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -123,6 +125,23 @@ impl SquirrelEngine {
         let last_hlc = match db::records::max_hlc(&conn)? {
             Some(s) => Hlc::from_str(&s).unwrap_or_else(|_| Hlc::new(node_id)),
             None    => Hlc::new(node_id),
+        };
+
+        // Resolve encryption key source → in-memory KEK.
+        let kek: Option<[u8; 32]> = match config.encryption_key {
+            None => None,
+            Some(KeySource::RawKey(k)) => Some(k),
+            Some(KeySource::Passphrase(ref pass)) => {
+                #[cfg(feature = "encryption")]
+                {
+                    let salt = db::config::get_or_create_kek_salt(&conn)?;
+                    Some(crate::crypto::derive_kek(pass, &salt)?)
+                }
+                #[cfg(not(feature = "encryption"))]
+                return Err(SquirrelError::Other(
+                    "KeySource::Passphrase requires the `encryption` feature".into(),
+                ));
+            }
         };
 
         let (events_tx, _) = broadcast::channel(64);
@@ -176,6 +195,7 @@ impl SquirrelEngine {
             blob_trigger,
             cache_dir,
             indexes: HashMap::new(),
+            kek,
         };
 
         tokio::spawn(actor_loop(rx, state));
@@ -387,20 +407,24 @@ fn handle_put(
     let hlc = state.last_hlc.tick();
     let now = now_ms();
 
+    let (stored_data, dek_encrypted, format_version) =
+        maybe_encrypt(&state.kek, data.clone(), &opts.encryption)?;
+
     let tx = state.conn.transaction()?;
     db::records::upsert(&tx, &RecordRow {
         id:             id.to_string(),
         collection:     collection.clone(),
-        data:           data.clone(),
+        data:           stored_data,
         hlc:            hlc.to_string(),
         schema_version: opts.schema_version.unwrap_or(0),
-        format_version: 0,
-        dek_encrypted:  None,
+        format_version,
+        dek_encrypted,
         deleted:        false,
         synced:         false,
         created_at:     now,
         updated_at:     now,
     })?;
+    // Outbox always carries the plaintext so that remote peers receive readable data.
     db::outbox::append(&tx, &id.to_string(), &collection, "upsert", &hlc.to_string(), Some(&data))?;
 
     // Maintain shadow index if registered for this collection.
@@ -420,7 +444,9 @@ fn handle_put(
 
 fn handle_get(state: &ActorState, collection: &str, id: Ulid) -> Result<Option<Record>> {
     let row = db::records::get(&state.conn, collection, &id.to_string())?;
-    Ok(row.filter(|r| !r.deleted).map(to_record))
+    row.filter(|r| !r.deleted)
+       .map(|r| maybe_decrypt(&state.kek, r).map(to_record))
+       .transpose()
 }
 
 fn handle_delete(state: &mut ActorState, collection: &str, id: Ulid) -> Result<()> {
@@ -557,6 +583,62 @@ async fn force_flush_blobs_via(trigger: Option<mpsc::Sender<BlobTrigger>>) -> Re
             reply_rx.await.map_err(|_| SquirrelError::ActorClosed)
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Encryption helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Encrypt `data` based on `ItemEncryption` and the engine's KEK.
+/// Returns `(data_to_store, dek_encrypted, format_version)`.
+fn maybe_encrypt(
+    kek: &Option<[u8; 32]>,
+    data: Vec<u8>,
+    enc: &ItemEncryption,
+) -> Result<(Vec<u8>, Option<Vec<u8>>, u8)> {
+    let should_encrypt = match enc {
+        ItemEncryption::Default  => kek.is_some(),
+        ItemEncryption::Enabled  => true,
+        ItemEncryption::Disabled => false,
+    };
+    if !should_encrypt {
+        return Ok((data, None, 0));
+    }
+    #[cfg(feature = "encryption")]
+    {
+        let kek = kek.as_ref().ok_or_else(|| {
+            SquirrelError::Other("ItemEncryption::Enabled requires a KEK — call .encryption_key() on the builder".into())
+        })?;
+        let (enc_data, enc_dek) = crate::crypto::encrypt_record(kek, &data)?;
+        return Ok((enc_data, Some(enc_dek), 1));
+    }
+    #[cfg(not(feature = "encryption"))]
+    Err(SquirrelError::Other(
+        "encryption requested but the `encryption` feature is not compiled in".into(),
+    ))
+}
+
+/// Decrypt `row.data` in-place if `format_version == 1`.
+fn maybe_decrypt(kek: &Option<[u8; 32]>, mut row: RecordRow) -> Result<RecordRow> {
+    if row.format_version != 1 {
+        return Ok(row);
+    }
+    #[cfg(feature = "encryption")]
+    {
+        let kek = kek.as_ref().ok_or_else(|| {
+            SquirrelError::Other("record is encrypted but no KEK is configured".into())
+        })?;
+        let enc_dek = row.dek_encrypted.as_deref().ok_or_else(|| {
+            SquirrelError::Other("format_version=1 but dek_encrypted is NULL".into())
+        })?;
+        row.data = crate::crypto::decrypt_record(kek, &row.data, enc_dek)?;
+        row.dek_encrypted = None;
+        return Ok(row);
+    }
+    #[cfg(not(feature = "encryption"))]
+    Err(SquirrelError::Other(
+        "record is encrypted but the `encryption` feature is not compiled in".into(),
+    ))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ pub mod types;
 
 pub(crate) mod blob;
 pub(crate) mod builder;
+pub(crate) mod crypto;
 pub(crate) mod db;
 pub(crate) mod engine;
 pub(crate) mod sync;
@@ -17,7 +18,7 @@ pub use engine::SquirrelEngine;
 pub use hlc::Hlc;
 pub use types::{
     BlobId, BlobInfo, BlobStatus, ColumnAffinity, FieldDef, IndexDef, IndexValue,
-    ItemEncryption, ListOpts, PendingError, PutBlobOpts, PutOpts, QueryFilter,
+    ItemEncryption, KeySource, ListOpts, PendingError, PutBlobOpts, PutOpts, QueryFilter,
     Record, RecordMeta, SortOrder, SyncEvent, SyncStats, Ulid,
 };
 

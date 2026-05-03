@@ -176,6 +176,20 @@ pub struct PendingError {
     pub next_retry_at_ms: u64,
 }
 
+// ── Encryption types ──────────────────────────────────────────────────────────
+
+/// How the Key Encryption Key (KEK) is supplied to the engine.
+#[derive(Clone)]
+pub enum KeySource {
+    /// Caller provides the raw 32-byte KEK directly.
+    /// Obtain it from a platform keyring, HSM, or secure enclave.
+    RawKey([u8; 32]),
+    /// Derive the KEK from a passphrase via Argon2id.
+    /// The KDF salt is generated on first open and stored in the `config` table.
+    /// Requires the `encryption` feature.
+    Passphrase(String),
+}
+
 // ── Index types ───────────────────────────────────────────────────────────────
 
 /// Declares which fields of a collection to index for fast querying.

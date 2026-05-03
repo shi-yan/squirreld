@@ -41,6 +41,26 @@ pub fn set(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Load the KDF salt used for passphrase → KEK derivation, generating one on first use.
+pub fn get_or_create_kek_salt(conn: &Connection) -> Result<[u8; 16]> {
+    if let Some(val) = get(conn, "kek_salt")? {
+        let bytes = hex_decode(&val)
+            .map_err(|_| SquirrelError::Other("corrupt kek_salt in config".into()))?;
+        if bytes.len() != 16 {
+            return Err(SquirrelError::Other("kek_salt must be 16 bytes".into()));
+        }
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    } else {
+        use rand::RngCore;
+        let mut salt = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut salt);
+        set(conn, "kek_salt", &hex_encode(&salt))?;
+        Ok(salt)
+    }
+}
+
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
