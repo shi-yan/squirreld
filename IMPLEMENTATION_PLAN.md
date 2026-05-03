@@ -1,169 +1,291 @@
 # Squirreld — Implementation Plan
 
-Each phase builds on the previous. Phases 1–3 produce a functional (non-encrypted, non-indexed) sync engine that unfolded can use. Phases 4–6 add the quality-of-life features.
+## Testing Philosophy
+
+Every phase includes tests before moving on. Two test tiers:
+
+**Tier 1 — Unit tests** (`cargo test`, no external deps):
+- Pure function tests: HLC arithmetic, crypto primitives, SQL generation, QueryExpr compilation
+- Integration tests against a real SQLite file in a `tempdir` (fast, hermetic)
+- Sync logic tests using **in-memory mock backends** — structs implementing `RecordBackend` / `BlobBackend` via a `HashMap` and a temp directory. These exercise conflict resolution, outbox ordering, retry scheduling, pull reconciliation, and encryption without any network calls.
+- The mock backends ship as a `test-utils` feature in the crate so downstream apps (e.g. unfolded) can use them too.
+
+**Tier 2 — Integration tests** (`cargo test --features integration-tests`, requires Docker):
+- Tests against **LocalStack** via the `testcontainers` + `testcontainers-modules` Rust crates. LocalStack emulates DynamoDB and S3 locally.
+- The `testcontainers` crate manages the Docker container lifecycle inside the test process — no manual setup required.
+- These tests exercise the actual AWS SDK calls: condition expressions, multipart upload protocol, GSI queries, etc.
+- Never use real AWS in automated tests. Real AWS is only for manual smoke-testing before a release.
+
+```
+crate features:
+  default          → core library only
+  test-utils       → exports InMemoryBackend, InMemoryBlobBackend for use in downstream tests
+  integration-tests → enables LocalStack-backed tests (requires Docker)
+```
 
 ---
 
 ## Phase 1: Foundation — Local Store + Actor
 
-**Goal**: A working local-only record store behind the MPSC actor. No cloud, no encryption, no indexing. Just a stable API and storage layer.
+**Goal**: A working local-only record store behind the async MPSC actor. No cloud, no encryption, no indexing. Stable API and storage layer.
 
-### Tasks
+### 1.1 Crate structure
 
-1. **Cargo setup**
-   - Set `edition = "2024"`, add `rusqlite` (bundled), `tokio`, `ulid`, `thiserror`, `tracing`, `serde_json`, `async-trait`
-   - Create `src/lib.rs`, `src/engine.rs`, `src/db/`, `src/hlc.rs`, `src/error.rs`
+```
+src/
+  lib.rs           — public re-exports
+  engine.rs        — SquirrelEngine handle + actor main loop
+  builder.rs       — EngineBuilder, EngineConfig, CollectionConfig
+  hlc.rs           — Hlc type, tick(), Display, FromStr, PartialOrd
+  error.rs         — SquirrelError, Result<T>
+  db/
+    mod.rs
+    schema.rs      — DDL, PRAGMA setup
+    config.rs      — config table helpers
+    records.rs     — CRUD + outbox append (atomic)
+    outbox.rs      — peek_batch, delete_batch, mark_retry
+  query.rs         — QueryExpr, to_sql()
+  types.rs         — Ulid newtype, RecordMeta, BlobId, BlobStatus, SyncStats, etc.
+```
 
-2. **HLC implementation** (`src/hlc.rs`)
+### 1.2 Tasks
+
+1. **Cargo.toml**: `rusqlite/bundled`, `tokio/full`, `ulid`, `thiserror`, `tracing`, `serde_json`, `async-trait`
+
+2. **`hlc.rs`**:
    - `struct Hlc { physical_ms: u64, logical: u16, node_id: [u8; 6] }`
-   - `impl Display` and `impl FromStr` using format `{physical_ms:013x}-{logical:04x}-{node_id_hex}`
-   - `Hlc::now(last: &Hlc) -> Hlc` — returns a new HLC that is strictly greater than `last` and wall clock
-   - `impl PartialOrd` based on string comparison (valid since format is lexicographically sortable)
+   - `Hlc::tick(last: &Hlc) -> Hlc` — returns `max(wall_clock, last.physical)` with incremented logical
+   - `impl Display` → `{physical_ms:013x}-{logical:04x}-{node_id_hex}`
+   - `impl FromStr` — parse the above format
+   - `impl PartialOrd` — delegates to string comparison (valid because format is lex-sortable)
 
-3. **SQLite schema** (`src/db/schema.rs`)
-   - `fn create_tables(conn: &Connection) -> Result<()>` — runs the full DDL from ARCHITECTURE §5
-   - Enable WAL mode: `PRAGMA journal_mode=WAL`
-   - Enable foreign keys: `PRAGMA foreign_keys=ON`
+3. **`db/schema.rs`**:
+   - `fn initialize(conn: &Connection) -> Result<()>` — sets WAL + foreign_keys, runs all CREATE TABLE IF NOT EXISTS from ARCHITECTURE §5
+   - Re-runnable: uses `IF NOT EXISTS` throughout, safe to call on every startup
 
-4. **Config table helpers** (`src/db/config.rs`)
+4. **`db/config.rs`**:
    - `fn get_or_create_node_id(conn: &Connection) -> Result<[u8; 6]>`
-   - `fn get_string(conn: &Connection, key: &str) -> Result<Option<String>>`
-   - `fn set_string(conn: &Connection, key: &str, value: &str) -> Result<()>`
+   - `fn get(conn: &Connection, key: &str) -> Result<Option<String>>`
+   - `fn set(conn: &Connection, key: &str, value: &str) -> Result<()>`
 
-5. **Record CRUD** (`src/db/records.rs`)
-   - `fn put(conn: &Connection, collection: &str, id: &str, data: &[u8], hlc: &Hlc, ...) -> Result<()>`
+5. **`db/records.rs`** — all writes append to the outbox in the same transaction:
+   - `fn upsert(conn: &Connection, record: &RecordRow) -> Result<()>`
    - `fn get(conn: &Connection, collection: &str, id: &str) -> Result<Option<RecordRow>>`
-   - `fn delete(conn: &Connection, collection: &str, id: &str, hlc: &Hlc) -> Result<()>` (sets tombstone)
+   - `fn soft_delete(conn: &Connection, collection: &str, id: &str, hlc: &Hlc) -> Result<()>`
    - `fn list(conn: &Connection, collection: &str, opts: &ListOpts) -> Result<Vec<RecordRow>>`
-   - Each write atomically appends to the outbox in the same transaction
 
-6. **Outbox helpers** (`src/db/outbox.rs`)
-   - `fn append(conn: &Connection, entry: &OutboxEntry) -> Result<()>`
-   - `fn peek_batch(conn: &Connection, n: usize) -> Result<Vec<OutboxEntry>>`
-   - `fn delete_batch(conn: &Connection, seqs: &[i64]) -> Result<()>`
-   - `fn mark_error(conn: &Connection, seq: i64, error: &str) -> Result<()>`
+6. **`db/outbox.rs`**:
+   - `fn peek_batch(conn: &Connection, limit: usize) -> Result<Vec<OutboxEntry>>` — `WHERE next_retry_at <= now() ORDER BY seq ASC`
+   - `fn delete_seqs(conn: &Connection, seqs: &[i64]) -> Result<()>`
+   - `fn mark_retry(conn: &Connection, seq: i64, error: &str) -> Result<()>` — increments retries, sets `next_retry_at = now + min(1000 * 2^retries, 300_000)ms`, appends to `error_log` JSON array (capped at 20 entries)
 
-7. **Actor + engine handle** (`src/engine.rs`)
-   - `enum Command` — Put, Get, Delete, List, Query, Search, PutBlob, GetBlob, BlobStatus, ForceSync, Subscribe, Shutdown
-   - `struct SquirrelEngine` — wraps `mpsc::Sender<Command>`
-   - `SquirrelEngine::open(config: EngineConfig) -> Result<Self>` — spawns actor task, returns handle
-   - Actor main loop: `while let Some(cmd) = rx.recv().await { handle_command(cmd, &state).await }`
+7. **`engine.rs`** — actor + handle:
+   - `enum Command { Put{...}, Get{...}, Delete{...}, List{...}, Shutdown{...}, ... }` with `oneshot::Sender` reply channels
+   - `struct SquirrelEngine(mpsc::Sender<Command>)` — `#[derive(Clone)]`
+   - `SquirrelEngine::open(config: EngineConfig) -> Result<Self>` — opens SQLite, runs `schema::initialize`, spawns actor task
+   - Actor loop: `while let Some(cmd) = rx.recv().await { dispatch(cmd, &mut state).await }`
 
-8. **Builder API** (`src/builder.rs`)
-   - `EngineBuilder` for constructing `EngineConfig`
-   - Validates that collection names are unique, index field names don't clash
+8. **`builder.rs`**:
+   - `EngineBuilder` with fluent API
+   - Validates: unique collection names, no reserved names (`config`, `outbox`, `blobs`, etc.)
 
-### Deliverable
+### 1.3 Unit Tests
 
-```rust
-let engine = SquirrelEngine::builder()
-    .db_path("~/.local/share/myapp/squirreld.db")
-    .collection("papers", CollectionConfig::default())
-    .build()
-    .await?;
+```
+tests/hlc.rs
+  - tick() produces strictly increasing values even when wall clock is frozen
+  - tick() handles logical counter overflow gracefully
+  - Display/FromStr round-trip
+  - PartialOrd: string comparison matches semantic ordering
 
-let id = engine.put("papers", None, b"{\"title\":\"Test\"}").await?;
-let data = engine.get("papers", id).await?.unwrap();
-assert_eq!(data, b"{\"title\":\"Test\"}");
+tests/basic_crud.rs  (uses tempdir + real SQLite)
+  - put then get returns the same bytes
+  - put with same id twice updates the record, preserves the higher HLC
+  - soft_delete sets deleted=1, get returns None
+  - list returns only non-deleted records in HLC descending order
+  - outbox has one entry per write, in seq order
+
+tests/outbox.rs
+  - peek_batch respects next_retry_at (future items not returned)
+  - mark_retry increments retries and sets correct next_retry_at
+  - error_log is a valid JSON array capped at 20 entries
+  - delete_seqs removes exactly the specified entries
 ```
 
 ---
 
 ## Phase 2: Sync Engine — DynamoDB Push/Pull
 
-**Goal**: Records written locally are pushed to DynamoDB. Records written on another device are pulled and merged locally. No encryption, no blob support yet.
+**Goal**: Records written locally push to DynamoDB. Records from another device pull and merge locally via LWW.
 
-### Tasks
+### 2.1 New modules
 
-1. **Backend HAL** (`src/backend/mod.rs`)
-   - Define `RecordBackend` trait (see ARCHITECTURE §7)
-   - Define `OutboxEntry`, `RemoteRecord`, `PushResult` types
+```
+src/
+  backend/
+    mod.rs         — RecordBackend trait, OutboxEntry, RemoteRecord, PushResult
+    dynamodb.rs    — DynamoDbBackend impl
+  sync/
+    mod.rs         — SyncLoop, push cycle, pull cycle, debounce timer
+```
 
-2. **DynamoDB backend** (`src/backend/dynamodb.rs`)
+### 2.2 Tasks
+
+1. **`backend/mod.rs`** — define the trait (see ARCHITECTURE §7):
+   ```rust
+   pub enum PushResult {
+       Ok { pushed: Vec<i64> },               // seqs successfully pushed
+       ConflictAt { record_id: String },       // LWW conflict, trigger pull
+       TransientError(anyhow::Error),
+   }
+   ```
+
+2. **`backend/dynamodb.rs`**:
    - Add `aws-sdk-dynamodb` to Cargo.toml
-   - `struct DynamoDbBackend { client: DynamoDbClient, table_name: String, user_id: String }`
-   - `impl RecordBackend for DynamoDbBackend`
-   - `push`: maps outbox entries to `TransactWriteItems` with condition expression `attribute_not_exists(hlc) OR hlc < :local_hlc`
-   - `pull_since`: queries the `hlc-index` GSI with `PK = USER#me AND hlc > :checkpoint`
+   - `DynamoDbBackend::new(config: DynamoDbConfig) -> Self`
+   - `ensure_table()` — creates table + GSI `sync-index` if absent (idempotent)
+   - `push()` — maps outbox entries to `TransactWriteItems` with condition `attribute_not_exists(hlc) OR hlc < :local_hlc`
+   - `pull_since()` — `Query` on `sync-index` with `KeyConditionExpression: #p = :main AND hlc > :checkpoint`, paginated, returns items sorted by `hlc ASC`
 
-3. **DynamoDB table bootstrap** (`src/backend/dynamodb.rs`)
-   - `DynamoDbBackend::ensure_table(client, table_name) -> Result<()>`
-   - Creates the table and GSI if they don't exist; idempotent
-   - Documents the required IAM permissions (as a comment or in README)
+3. **`sync/mod.rs`**:
+   - `struct SyncLoop` holds `Arc<dyn RecordBackend>`, `Arc<Mutex<Connection>>`, `broadcast::Sender<SyncEvent>`
+   - `async fn run_push_cycle(&self) -> Result<()>` — implements ARCHITECTURE §8.1
+   - `async fn run_pull_cycle(&self) -> Result<()>` — implements ARCHITECTURE §8.2
+   - `async fn run(self, trigger_rx: mpsc::Receiver<()>)` — main loop:
+     - Waits for trigger OR 60s timeout
+     - Debounces: if another trigger arrives within 500ms, resets the timer
+     - Runs push then pull
+   - Pull reconciliation: after a `ConflictAt` from push, run pull, then re-examine the outbox head — delete it if remote won, retry if local still wins
 
-4. **Sync loop** (`src/sync/mod.rs`)
-   - `struct SyncLoop { backend: Arc<dyn RecordBackend>, db: Arc<Mutex<Connection>>, ... }`
-   - `async fn run_push_cycle(&self) -> Result<()>` — implements the push algorithm from ARCHITECTURE §8.1
-   - `async fn run_pull_cycle(&self) -> Result<()>` — implements the pull algorithm from ARCHITECTURE §8.2
-   - `async fn run(&self, mut trigger: mpsc::Receiver<()>)` — waits for trigger, debounces 500ms, runs push then pull
-   - Triggers: post-write debounce, 60s periodic timer, `force_sync` command
+4. **Actor integration**:
+   - Post-write: send `()` to the sync trigger channel (non-blocking, drops if full — debounce handles the rest)
+   - `ForceSync` command: send trigger and await `SyncStats` reply
 
-5. **Conflict resolution in pull**
-   - After pulling remote records, cross-check outbox: any outbox entry for a record where remote won gets deleted
-   - Any outbox entry where local HLC > remote HLC is kept (will be pushed in the next push cycle)
+5. **`SyncEvent` broadcast** in `types.rs`:
+   ```rust
+   pub enum SyncEvent {
+       PushComplete(SyncStats),
+       PullComplete(SyncStats),
+       BlobUploaded { blob_id: BlobId },
+       RetryScheduled { seq: i64, retries: u32, next_retry_ms: u64, error: String },
+   }
+   ```
 
-6. **SyncEvent broadcast**
-   - `enum SyncEvent { PushComplete(SyncStats), PullComplete(SyncStats), PermanentFailure { seq: i64, error: String } }`
-   - Actor holds a `broadcast::Sender<SyncEvent>`; `engine.sync_events()` returns a receiver
+### 2.3 Unit Tests (Tier 1 — in-memory mock backend)
 
-7. **Retry logic**
-   - Transient errors: increment `outbox.retries`, apply `min(60 * 2^retries, 300)` second backoff
-   - After 10 retries: mark as permanent failure, emit `SyncEvent::PermanentFailure`
+```
+tests/sync_push.rs
+  - Single device: write N records, push succeeds, outbox is empty
+  - Outbox is FIFO: if seq 3 has next_retry_at in the future, seq 4+ are not pushed
+  - Transient error: retries incremented, next_retry_at set with correct backoff
+  - Backoff ceiling: retries=20 still produces next_retry_at <= now + 300_000ms
 
-### Deliverable
+tests/sync_pull.rs
+  - Remote record not in local: gets inserted
+  - Remote HLC > local HLC: local record updated, outbox entry deleted
+  - Remote HLC < local HLC: local record untouched, outbox entry kept
+  - Remote HLC == local HLC: no-op (same device, idempotent)
+  - last_pull_hlc advances to max(remote HLC) after successful pull
 
-Records written on device A appear on device B after a `force_sync()` on both. LWW conflict tested with two devices writing the same record ID while offline.
+tests/sync_conflict.rs
+  - Device A and B both write record X while offline
+  - A pushes first (succeeds), B pushes second (ConflictAt)
+  - B triggers pull: gets A's version
+  - If A's HLC > B's HLC: B discards its outbox entry, local = A's version
+  - If B's HLC > A's HLC: B retries push (B wins), A pulls on next cycle
+
+tests/sync_two_devices.rs  (Tier 1, two SquirrelEngine instances, shared InMemoryBackend)
+  - End-to-end: engine_a writes, force_sync; engine_b force_sync; engine_b.get returns a's data
+  - Tombstone propagation: engine_a deletes record; engine_b pulls; engine_b.get returns None
+```
+
+### 2.4 Integration Tests (Tier 2 — LocalStack)
+
+```
+tests/dynamodb_integration.rs  (#[cfg(feature = "integration-tests")])
+  - ensure_table() is idempotent (call twice, no error)
+  - push() correctly writes items with condition expressions
+  - push() returns ConflictAt when remote HLC is higher
+  - pull_since(None) returns all items
+  - pull_since(Some(hlc)) returns only items with hlc > checkpoint
+  - Pagination: pull_since handles result sets > DynamoDB page size (1MB)
+```
 
 ---
 
 ## Phase 3: Blob Store — S3 + Resumable Uploads
 
-**Goal**: Large files (PDFs, images) can be stored with S3 as the backend. Uploads resume correctly after interruption.
+**Goal**: Large files can be staged locally and uploaded to S3 in the background. Uploads resume after interruption.
 
-### Tasks
+### 3.1 New modules
 
-1. **BlobBackend HAL** (`src/backend/mod.rs`)
-   - Define `BlobBackend` trait (see ARCHITECTURE §7)
+```
+src/
+  backend/
+    s3.rs          — S3Backend impl
+  blob/
+    mod.rs
+    staging.rs     — copy to cache dir, assign BlobId
+    uploader.rs    — background upload loop, resume logic
+    downloader.rs  — cache-first download
+```
 
-2. **S3 backend** (`src/backend/s3.rs`)
-   - Add `aws-sdk-s3` to Cargo.toml
-   - Implement all multipart methods
-   - `download`: streams `GetObject` response to a `tokio::fs::File`, returns bytes written
-   - For files < 5MB: use `PutObject` / `GetObject` directly, skip multipart
+### 3.2 Tasks
 
-3. **Staging area**
-   - `src/blob/staging.rs`
-   - `fn stage(source: &Path, cache_dir: &Path) -> Result<(BlobId, PathBuf)>` — copies file, assigns ULID
-   - `fn cache_path(cache_dir: &Path, blob_id: BlobId) -> PathBuf`
+1. **`backend/s3.rs`**: Add `aws-sdk-s3`, `bytes` to Cargo.toml; implement `BlobBackend` trait
 
-4. **Blob uploader** (`src/blob/uploader.rs`)
-   - `struct BlobUploader { backend: Arc<dyn BlobBackend>, db: Arc<Mutex<Connection>>, cache_dir: PathBuf }`
-   - `async fn run_upload_cycle(&self) -> Result<()>`:
-     - Scan `status IN ('pending', 'uploading')`
-     - For 'uploading': call `resume_upload`
-     - For 'pending': call `start_upload`
-   - `async fn start_upload(&self, blob: BlobRow) -> Result<()>`
-   - `async fn resume_upload(&self, blob: BlobRow) -> Result<()>` — calls ListParts, skips uploaded chunks
+2. **`blob/staging.rs`**:
+   - `fn stage(source: &Path, cache_dir: &Path) -> Result<(BlobId, PathBuf)>` — copies file, assigns ULID filename
+   - `const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024` (5MB)
 
-5. **Blob downloader** (`src/blob/downloader.rs`)
-   - `async fn get_blob(blob_id: BlobId, dest: &Path) -> Result<()>`
-   - Checks cache first; downloads from S3 if not cached; updates `blobs` table status
+3. **`blob/uploader.rs`**:
+   - `async fn run_upload_cycle(...)` — scans `status IN ('pending','uploading') AND next_retry_at <= now()`
+   - `start_upload`: CreateMultipartUpload → save upload_id → upload chunks → CompleteMultipartUpload
+   - `resume_upload`: ListParts → skip already-uploaded → upload missing → CompleteMultipartUpload
+   - On any S3 error: `mark_blob_retry()` — same exponential backoff as outbox
+   - On `NoSuchUpload` (7-day expiry): reset to `status='pending'`, clear upload_id
 
-6. **Chunk size constant**
-   - `const CHUNK_SIZE: usize = 5 * 1024 * 1024;` — 5MB
-   - Final chunk may be smaller (S3 allows this)
+4. **`blob/downloader.rs`**:
+   - `async fn get_blob(...)` — check local_path exists → S3 GetObject stream to dest → update status='cached'
 
-7. **Actor integration**
-   - `PutBlob` command: stage → insert to DB → trigger uploader → return BlobId
+5. **`CacheEvictionPolicy` trait** — defined now, `NeverEvict` as default, no eviction logic implemented
+
+6. **Actor integration**:
+   - `PutBlob` command: stage → INSERT blobs → trigger upload cycle → return BlobId
    - `GetBlob` command: check cache → maybe download → return path
-   - `BlobStatus` command: return current status from `blobs` table
+   - `BlobStatus` command: SELECT from blobs
+   - `EvictBlob` command: delete local file, SET status='uploaded', local_path=NULL
+   - `BlobCacheSize` command: `SELECT SUM(size_bytes) FROM blobs WHERE local_path IS NOT NULL`
 
-### Deliverable
+### 3.3 Unit Tests
 
-A 200MB PDF can be:
-- Staged and queued in < 100ms (caller is unblocked immediately)
-- Uploaded to S3 in the background
-- Interrupted mid-upload and resumed correctly on next run
+```
+tests/blob_staging.rs
+  - stage() copies file to cache dir with ULID filename
+  - Small file (< 5MB) uses direct PutObject path (via mock BlobBackend)
+  - Large file (> 5MB) uses multipart path
+
+tests/blob_upload.rs  (mock BlobBackend that records calls)
+  - Happy path: pending → uploading → uploaded
+  - Resume: mock returns parts [1,2,3] from ListParts; uploader only uploads [4,5]
+  - Retry: transient error increments retries, sets next_retry_at
+  - NoSuchUpload: resets to status='pending', clears upload_id
+
+tests/blob_download.rs
+  - Cache hit: returns local path without calling BlobBackend
+  - Cache miss: calls download(), updates status='cached', local_path set
+  - EvictBlob: local file deleted, status='uploaded', local_path=NULL
+```
+
+### 3.4 Integration Tests (LocalStack)
+
+```
+tests/s3_integration.rs  (#[cfg(feature = "integration-tests")])
+  - Multipart upload completes successfully
+  - ListParts returns correct ETags after partial upload
+  - Resume from part 3 of 5 uploads only parts 3-5
+  - Download returns exact bytes that were uploaded
+```
 
 ---
 
@@ -171,93 +293,168 @@ A 200MB PDF can be:
 
 **Goal**: Callers can define indexed fields and run structured queries and full-text search against local data.
 
-### Tasks
+### 4.1 New modules
 
-1. **Collection configuration** (`src/collection.rs`)
-   - `struct CollectionConfig { schema_version: u32, migrate: Option<MigrateFn>, indices: Vec<IndexDef>, fts_fields: Vec<String> }`
-   - `struct IndexDef { field_path: String, kind: IndexKind }`
-   - `enum IndexKind { Text, Integer, Float, TextArray }`
+```
+src/
+  collection.rs    — CollectionConfig, IndexDef, IndexKind
+  db/
+    indices.rs     — shadow table DDL, index extraction, FTS update
+```
 
-2. **Shadow table DDL generation** (`src/db/indices.rs`)
-   - `fn ensure_shadow_table(conn: &Connection, collection: &str, indices: &[IndexDef]) -> Result<()>`
-   - Generates `CREATE TABLE IF NOT EXISTS idx_{collection} (record_id TEXT PRIMARY KEY, ...)`
-   - Column types map from `IndexKind`
-   - `fn ensure_fts_table(conn: &Connection, collection: &str, fts_fields: &[String]) -> Result<()>`
+### 4.2 Tasks
 
-3. **Index extraction** (`src/db/indices.rs`)
-   - `fn extract_and_upsert(conn: &Connection, collection: &str, record_id: &str, data: &[u8], config: &CollectionConfig) -> Result<()`
-   - Uses `serde_json::Value` to navigate nested field paths (dot notation: `"metadata.year"`)
-   - Called inside the same transaction as the record write
+1. **`collection.rs`**:
+   ```rust
+   pub struct CollectionConfig {
+       pub schema_version: u32,
+       pub encryption: CollectionEncryption,  // Default | Enabled | Disabled
+       pub migrate: Option<Arc<dyn Fn(u32, &[u8]) -> Result<Vec<u8>> + Send + Sync>>,
+       pub indices: Vec<IndexDef>,
+       pub fts_fields: Vec<String>,
+   }
+   pub struct IndexDef { pub field_path: String, pub kind: IndexKind }
+   pub enum IndexKind { Text, Integer, Float, TextArray }
+   ```
 
-4. **FTS update trigger**
-   - After shadow table upsert, run `INSERT INTO fts_{collection}(record_id, content) VALUES (?, ?)` with concatenated FTS fields
-   - FTS deletions handled by `DELETE FROM fts_{collection} WHERE record_id = ?` before insert
+2. **`db/indices.rs`**:
+   - `fn ensure_shadow_table(conn, collection, indices) -> Result<()>` — `CREATE TABLE IF NOT EXISTS idx_{collection} (...)`
+   - `fn ensure_fts_table(conn, collection, fts_fields) -> Result<()>` — `CREATE VIRTUAL TABLE IF NOT EXISTS fts_{collection} USING fts5(...)`; skipped if `fts_fields` is empty
+   - `fn extract_and_upsert(conn, collection, record_id, plaintext_data, config) -> Result<()>` — runs inside the same transaction as the record write
+   - `fn delete_index_entry(conn, collection, record_id) -> Result<()>`
+   - Field path resolution: dot notation (`"meta.year"`) and array flattening (`"authors[].name"`)
 
-5. **QueryExpr to SQL** (`src/query.rs`)
-   - `fn to_sql(expr: &QueryExpr, collection: &str) -> (String, Vec<rusqlite::types::Value>)`
-   - Generates parameterized SQL; no string interpolation of user data
+3. **`query.rs`**:
+   - `fn to_sql(collection: &str, expr: &QueryExpr, opts: &ListOpts) -> (String, Vec<rusqlite::types::Value>)` — pure function, fully parameterized
 
-6. **Schema migration hook**
-   - On actor startup: for each collection, run `SELECT id, data, schema_version FROM records WHERE collection = ? AND schema_version < ?`
-   - For each stale record: call `migrate(old_version, data)`, write back with new schema_version, update index
+4. **Schema migration on startup**:
+   - For each collection with a `migrate` hook: `SELECT id, data, schema_version FROM records WHERE collection=? AND schema_version < ?`
+   - Call `migrate(old_version, data)` → write back with new schema_version and updated index
 
-### Deliverable
+5. **Actor integration**: every `put` now calls `extract_and_upsert` after writing the record
 
-```rust
-let results = engine.query("papers",
-    QueryExpr::and(
-        QueryExpr::eq("year", 2023),
-        QueryExpr::eq("tags", "llm")
-    )
-).await?;
+### 4.3 Unit Tests
 
-let hits = engine.search("papers", "attention mechanism").await?;
+```
+tests/index_extraction.rs
+  - Flat field: {"year": 2023} → idx_papers.year = 2023
+  - Nested field: {"meta": {"year": 2023}} → correct extraction
+  - Array field: {"tags": ["a","b"]} → stored as JSON, queried with LIKE
+  - Missing field: NULL stored, query with Eq returns nothing
+  - Deleted record: index entry removed
+
+tests/query.rs
+  - QueryExpr::Eq generates correct WHERE clause
+  - QueryExpr::And / Or generates correct compound WHERE
+  - to_sql never interpolates strings (all values are bound parameters)
+  - list() with OrderBy HLC desc returns correct order
+
+tests/fts.rs
+  - Search "attention mechanism" returns records containing both words
+  - Porter stemming: "running" matches "run"
+  - Deleted record no longer appears in FTS results
+  - Record update re-indexes correctly
+
+tests/migration.rs
+  - Record with schema_version=1 is passed to migrate hook when current=2
+  - Migrated record has updated schema_version and updated index
+  - Records already at current version are not touched
 ```
 
 ---
 
 ## Phase 5: E2E Encryption
 
-**Goal**: All data at rest and in transit is encrypted. The backend (DynamoDB + S3) never sees plaintext.
+**Goal**: All data at rest (SQLite, DynamoDB, S3) is encrypted. Keys are app-level; encryption is toggled per item. Zero behavioral change to the rest of the API.
 
-### Tasks
+### 5.1 New modules
 
-1. **Crypto primitives** (`src/crypto.rs`)
-   - Add `aes-gcm`, `argon2`, `rand` to Cargo.toml
-   - `fn generate_dek() -> [u8; 32]`
-   - `fn encrypt_dek(dek: &[u8; 32], kek: &[u8; 32]) -> Result<Vec<u8>>`
-   - `fn decrypt_dek(encrypted_dek: &[u8], kek: &[u8; 32]) -> Result<[u8; 32]>`
-   - `fn encrypt_record(plaintext: &[u8], dek: &[u8; 32]) -> Result<Vec<u8>>` — `[nonce(12)] || [ciphertext] || [tag(16)]`
-   - `fn decrypt_record(ciphertext: &[u8], dek: &[u8; 32]) -> Result<Vec<u8>>`
-   - `fn encrypt_chunk(chunk: &[u8], dek: &[u8; 32], base_nonce: &[u8; 12], chunk_index: u32) -> Result<Vec<u8>>`
-   - `fn decrypt_chunk(ciphertext: &[u8], dek: &[u8; 32], base_nonce: &[u8; 12], chunk_index: u32) -> Result<Vec<u8>>`
+```
+src/
+  crypto/
+    mod.rs         — public re-exports
+    primitives.rs  — AES-256-GCM encrypt/decrypt, DEK generation
+    kek.rs         — KeySource, master key derivation, keyring integration
+    chunk.rs       — deterministic per-chunk nonce derivation for blobs
+```
 
-2. **Key management** (`src/crypto/keychain.rs`)
-   - Add `keyring` to Cargo.toml
-   - `struct KeyManager { service_name: String }`
-   - `fn get_or_create_master_key(&self) -> Result<[u8; 32]>` — reads from keychain, creates and stores if absent
-   - `fn derive_from_passphrase(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]>` — Argon2id fallback
-   - The salt is stored in the `config` table
+### 5.2 Tasks
 
-3. **Encryption integration in actor**
-   - If `EncryptionConfig::Enabled`, wrap all `db::records::put` calls with encrypt/decrypt
-   - Index extraction happens **before** encryption (on plaintext)
-   - FTS is disabled when encryption is enabled (logged as a warning on startup)
-   - `format_version` field set to `1` for all encrypted records
+1. **Cargo.toml**: add `aes-gcm`, `argon2`, `rand`, `keyring`
 
-4. **Blob encryption integration**
-   - `BlobUploader`: if encryption enabled, encrypt each chunk before uploading
-   - Store `dek_encrypted` in S3 user metadata: `x-amz-meta-dek = base64(encrypted_dek)`
-   - Store `base_nonce` in S3 user metadata: `x-amz-meta-nonce = base64(base_nonce)`
-   - `BlobDownloader`: read metadata, decrypt DEK with KEK, decrypt chunks on the fly
+2. **`crypto/primitives.rs`**:
+   - `fn generate_dek() -> [u8; 32]` — `rand::thread_rng().fill_bytes`
+   - `fn encrypt(plaintext: &[u8], dek: &[u8; 32]) -> Result<Vec<u8>>` → `nonce(12B) || ciphertext || tag(16B)`
+   - `fn decrypt(ciphertext: &[u8], dek: &[u8; 32]) -> Result<Vec<u8>>`
+   - `fn wrap_dek(dek: &[u8; 32], kek: &[u8; 32]) -> Result<Vec<u8>>` — encrypt DEK with KEK
+   - `fn unwrap_dek(wrapped: &[u8], kek: &[u8; 32]) -> Result<[u8; 32]>`
 
-5. **Encrypted shadow indices (optional, initially skipped)**
-   - If needed in the future: store `SHA-256(field_value)` in shadow index for equality-only queries
-   - Skip for Phase 5; callers can fetch-and-filter in memory
+3. **`crypto/kek.rs`**:
+   - `fn resolve_kek(source: &KeySource, config_conn: &Connection) -> Result<[u8; 32]>`
+   - For `Keychain`: try `keyring::Entry::new(service, username).get_password()`; if absent, generate random key and store it; if keyring unavailable, fall through to error (caller must provide passphrase fallback)
+   - For `Passphrase(fn)`: call fn(), derive key with Argon2id (params: m=65536, t=3, p=4); load/generate Argon2 salt from `config` table
+   - `keyring` crate targets: macOS Keychain, Linux Secret Service (libsecret), Windows Credential Manager — all three work without additional config
 
-### Deliverable
+4. **`crypto/chunk.rs`**:
+   - `fn chunk_nonce(base_nonce: &[u8; 12], chunk_index: u32) -> [u8; 12]` — XOR base_nonce with little-endian chunk_index in the lower 4 bytes
+   - `fn encrypt_chunk(data: &[u8], dek: &[u8; 32], base_nonce: &[u8; 12], chunk_index: u32) -> Result<Vec<u8>>`
+   - `fn decrypt_chunk(data: &[u8], dek: &[u8; 32], base_nonce: &[u8; 12], chunk_index: u32) -> Result<Vec<u8>>`
 
-Engine configured with encryption enabled stores only ciphertext in SQLite and DynamoDB. Master key is retrieved from the OS keychain. The app works normally with no API changes.
+5. **Encryption resolution in actor** (`resolve_encryption` helper):
+   ```
+   item_opts.encryption == Enabled  → encrypt
+   item_opts.encryption == Disabled → plaintext
+   item_opts.encryption == Default  → collection default, then engine default
+   ```
+
+6. **Record write path with encryption**:
+   - `resolve_encryption(...)` → if encrypting: `generate_dek()`, `encrypt(data, dek)`, `wrap_dek(dek, kek)`
+   - Set `format_version = 1`, `dek_encrypted = wrapped_dek`
+   - Index extraction runs on **plaintext** before encryption, inside same transaction
+
+7. **Record read path**:
+   - Check `format_version`; if 1: `unwrap_dek(dek_encrypted, kek)` → `decrypt(data, dek)`
+   - Return plaintext to caller
+
+8. **Blob encryption** (in `uploader.rs`):
+   - On staging: generate DEK + base_nonce, encrypt each chunk using `crypto::chunk`, store `dek_encrypted` + `base_nonce` in blobs table
+   - S3 upload sends ciphertext; stores `dek_encrypted` and `base_nonce` as S3 user metadata
+
+9. **FTS behavior with encryption**: At collection startup, if `CollectionEncryption::Enabled`, skip `ensure_fts_table`. Search falls back to `list() + decrypt + in-memory filter` for encrypted collections.
+
+### 5.3 Unit Tests
+
+```
+tests/crypto_primitives.rs
+  - encrypt/decrypt round-trip produces original plaintext
+  - decrypt with wrong DEK returns Err (auth tag mismatch)
+  - wrap_dek/unwrap_dek round-trip
+  - unwrap_dek with wrong KEK returns Err
+  - generate_dek returns 32 bytes of entropy (not all-zeros, not deterministic across calls)
+
+tests/crypto_chunks.rs
+  - chunk_nonce(base, 0) != chunk_nonce(base, 1) (different chunks → different nonces)
+  - chunk_nonce is deterministic: same (base, index) always returns same nonce
+  - encrypt_chunk/decrypt_chunk round-trip for chunks of various sizes
+  - decrypt with wrong chunk_index returns Err
+
+tests/encrypted_records.rs  (real SQLite + mock backend, encryption enabled)
+  - put() stores ciphertext in SQLite (data field is not valid UTF-8 JSON)
+  - get() returns original plaintext
+  - Index table contains plaintext field values (not ciphertext)
+  - format_version=1 in records table
+  - Mixed collection: one record encrypted, one not — both readable
+
+tests/kek_passphrase.rs
+  - resolve_kek with Passphrase: same passphrase → same KEK (deterministic via stored salt)
+  - resolve_kek with Passphrase: different passphrase → different KEK
+  - Argon2 salt stored in config table on first call, reused on subsequent calls
+
+tests/encrypted_blobs.rs  (mock BlobBackend)
+  - staged blob is encrypted before upload (mock receives ciphertext, not original bytes)
+  - resume: partial re-encryption of only missing chunks
+  - download: decrypted bytes match original file
+```
 
 ---
 
@@ -265,37 +462,51 @@ Engine configured with encryption enabled stores only ciphertext in SQLite and D
 
 **Goal**: Replace unfolded's broken sync engine with squirreld.
 
-### Tasks
+### 6.1 Tasks
 
-1. Add squirreld as a path dependency in unfolded's Cargo.toml
-2. Define collections: `papers`, `notes`, `readlist`
-3. Register index extractors for each collection
-4. Replace the current database access layer with squirreld's API
-5. Integrate `sync_events()` receiver with the Tauri event system to update UI on sync state changes
-6. Wire S3 PDF uploads/downloads through `put_blob` / `get_blob`
-7. Test the full offline scenario: add paper + notes offline, sync, verify on second device
+1. Add squirreld as a path/git dependency in unfolded's Cargo.toml:
+   ```toml
+   [dependencies]
+   squirreld = { path = "../squirreld", features = ["test-utils"] }
+   ```
+
+2. **Collection setup** — define at app startup:
+
+   | Collection | `encryption` | `fts_fields` | `indices` |
+   |---|---|---|---|
+   | `papers` | `Default` (enabled) | `title`, `abstract` | `title`, `year`, `tags`, `read_status` |
+   | `notes` | `Default` (enabled) | `content` | `paper_id`, `page` |
+   | `readlist` | `Disabled` | — | `paper_id`, `status`, `progress` |
+
+3. **Passphrase integration**: unfolded already presents a password screen; pass the password via `KeySource::Passphrase` closure.
+
+4. **PDF blobs**: `put_blob(pdf_path, s3_key, BlobPutOpts { encryption: Default, record_id: Some(paper_id) })`. The `papers` record stores the returned `BlobId`.
+
+5. **Replace current database layer**: swap unfolded's ad-hoc SQLite calls with squirreld's `put`/`get`/`query` API.
+
+6. **UI sync status**: subscribe to `engine.sync_events()` receiver; map events to Tauri frontend events for status indicators (syncing spinner, last-synced timestamp, pending errors badge).
+
+7. **End-to-end offline test**: add a test using squirreld's `InMemoryBackend` (`test-utils` feature) that simulates adding a paper + notes offline and verifies correct state after sync.
 
 ---
 
-## Testing Strategy
+## Dependency Additions by Phase
 
-Each phase should include:
-- **Unit tests** for pure functions (HLC arithmetic, crypto primitives, SQL generation)
-- **Integration tests** using a temporary SQLite file (`tempfile` crate)
-- **Backend tests** using `localstack` (local AWS emulator) in CI for DynamoDB and S3
-
-Phase 2 onward: a test that simulates two "devices" (two `SquirrelEngine` instances pointing at the same DynamoDB table via localstack) and verifies correct LWW merge behavior.
+| Phase | New Cargo deps |
+|---|---|
+| 1 | `rusqlite/bundled`, `tokio/full`, `ulid`, `thiserror`, `tracing`, `serde_json`, `async-trait`, `tempfile` (test) |
+| 2 | `aws-sdk-dynamodb`, `aws-config`, `testcontainers`, `testcontainers-modules` (integration test) |
+| 3 | `aws-sdk-s3`, `bytes` |
+| 4 | (no new deps) |
+| 5 | `aes-gcm`, `argon2`, `rand`, `keyring` |
+| 6 | (squirreld added as dep in unfolded) |
 
 ---
 
 ## Open Questions
 
-1. **Passphrase vs. keychain**: Should the engine support both modes simultaneously (keychain with passphrase fallback), or require the caller to pick one? Recommendation: both, with keychain tried first and passphrase-derived key as fallback.
+1. **Passphrase vs. keychain UX**: Should the engine silently try the keychain first and fall back to prompting for a passphrase, or should the app explicitly choose one? Recommendation: let the app choose via `KeySource`. If the app wants "try keychain, fall back to passphrase", it constructs a small wrapper closure that tries `keyring` first.
 
-2. **S3 cache eviction**: The local blob cache will grow unbounded. Should squirreld provide a cache eviction policy (e.g. LRU eviction beyond a configured max size), or leave that to the caller? Recommendation: caller-controlled; squirreld provides a `blob_cache_size()` query and a `evict_blob(blob_id)` command.
+2. **S3 key namespace**: Should the S3 key always be fully caller-controlled, or should the engine prefix with `{user_id}/`? Recommendation: caller-controlled, but document the convention `{user_id}/{collection}/{blob_id}` so apps stay consistent.
 
-3. **Outbox dead-letter handling**: After a permanent push failure, should the entry stay in SQLite indefinitely for manual inspection, or be auto-deleted after N days? Recommendation: keep it, and expose a `dead_outbox_entries()` query so callers can surface errors in the UI.
-
-4. **Collection-level encryption toggle**: Should some collections be encrypted and others not? Recommendation: not for now; encryption is engine-wide. Simplicity wins for a personal tool.
-
-5. **Multi-table DynamoDB vs. single-table**: Single-table design chosen for Phase 2. If a collection grows to > 10 million records, the GSI scan for pull could become expensive. At that scale, a per-collection table is better. Not a concern for personal use.
+3. **Outbox inspection API**: `pending_errors()` returns items with at least one failed retry. Should there also be a `clear_error(seq)` command to let the user discard a stuck entry manually? Recommendation: yes — add it in Phase 2, it's a one-liner.
