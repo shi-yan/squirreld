@@ -69,7 +69,7 @@ async fn device_a_writes_device_b_receives() {
     a.force_sync().await.unwrap();
     b.force_sync().await.unwrap();
 
-    let rec = b.get("papers", id).await.unwrap();
+    let rec = b.get("papers", &id).await.unwrap();
     assert!(rec.is_some(), "B must receive A's record after sync");
     assert_eq!(rec.unwrap().data, b"paper payload");
 }
@@ -94,7 +94,7 @@ async fn multiple_records_all_sync() {
     b.force_sync().await.unwrap();
 
     for (i, id) in ids.iter().enumerate() {
-        let rec = b.get("papers", *id).await.unwrap().unwrap();
+        let rec = b.get("papers", id).await.unwrap().unwrap();
         assert_eq!(rec.data, [i as u8]);
     }
 }
@@ -112,12 +112,12 @@ async fn concurrent_writes_lww_higher_hlc_wins() {
     let b = device("b", store.clone(), blobs.clone(), &dir_b).await;
 
     // Both devices write the same record while offline.
-    let id = squirreld::Ulid::new();
-    a.put("notes", Some(id), b"A's version".to_vec(), PutOpts::default()).await.unwrap();
+    let id = squirreld::Ulid::new().to_string();
+    a.put("notes", Some(id.clone()), b"A's version".to_vec(), PutOpts::default()).await.unwrap();
 
     // B writes *after* A — B's HLC will be higher.
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    b.put("notes", Some(id), b"B's version".to_vec(), PutOpts::default()).await.unwrap();
+    b.put("notes", Some(id.clone()), b"B's version".to_vec(), PutOpts::default()).await.unwrap();
 
     // A syncs first, then B.
     a.force_sync().await.unwrap();
@@ -127,8 +127,8 @@ async fn concurrent_writes_lww_higher_hlc_wins() {
     a.force_sync().await.unwrap();
 
     // B has a higher HLC → B wins everywhere.
-    let rec_a = a.get("notes", id).await.unwrap().unwrap();
-    let rec_b = b.get("notes", id).await.unwrap().unwrap();
+    let rec_a = a.get("notes", &id).await.unwrap().unwrap();
+    let rec_b = b.get("notes", &id).await.unwrap().unwrap();
     assert_eq!(rec_a.data, b"B's version", "A should adopt B's winning version");
     assert_eq!(rec_b.data, b"B's version");
 }
@@ -149,13 +149,13 @@ async fn delete_propagates_to_second_device() {
         .await.unwrap();
     a.force_sync().await.unwrap();
     b.force_sync().await.unwrap();
-    assert!(b.get("papers", id).await.unwrap().is_some());
+    assert!(b.get("papers", &id).await.unwrap().is_some());
 
-    a.delete("papers", id).await.unwrap();
+    a.delete("papers", &id).await.unwrap();
     a.force_sync().await.unwrap();
     b.force_sync().await.unwrap();
 
-    assert!(b.get("papers", id).await.unwrap().is_none(), "tombstone must propagate");
+    assert!(b.get("papers", &id).await.unwrap().is_none(), "tombstone must propagate");
 }
 
 // ── Offline-first: queue while offline, flush when online ────────────────────
@@ -193,7 +193,7 @@ async fn offline_writes_queue_and_flush_on_connect() {
     b.force_sync().await.unwrap();
 
     for (i, id) in ids.iter().enumerate() {
-        let rec = b.get("papers", *id).await.unwrap().unwrap();
+        let rec = b.get("papers", id).await.unwrap().unwrap();
         assert_eq!(rec.data, [i as u8]);
     }
 }
@@ -241,7 +241,7 @@ async fn encrypted_records_sync_correctly() {
     a.force_sync().await.unwrap();
     b.force_sync().await.unwrap();
 
-    let rec = b.get("docs", id).await.unwrap().unwrap();
+    let rec = b.get("docs", &id).await.unwrap().unwrap();
     assert_eq!(rec.data, b"encrypted content", "B must decrypt synced record");
 }
 
