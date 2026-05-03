@@ -43,7 +43,7 @@ async fn put_and_get_roundtrip_with_raw_key() {
         .await
         .unwrap();
 
-    let rec = engine.get("notes", id).await.unwrap().unwrap();
+    let rec = engine.get("notes", &id).await.unwrap().unwrap();
     assert_eq!(rec.data, b"secret message");
 }
 
@@ -79,7 +79,7 @@ async fn passphrase_roundtrip() {
         .await
         .unwrap();
 
-    let rec = engine.get("docs", id).await.unwrap().unwrap();
+    let rec = engine.get("docs", &id).await.unwrap().unwrap();
     assert_eq!(rec.data, b"sensitive doc");
 }
 
@@ -98,7 +98,7 @@ async fn passphrase_reopens_successfully() {
 
     // Re-open with the same passphrase — KDF salt is reloaded from config table.
     let engine2 = engine_with_passphrase(&dir, pass).await;
-    let rec = engine2.get("docs", id).await.unwrap().unwrap();
+    let rec = engine2.get("docs", &id).await.unwrap().unwrap();
     assert_eq!(rec.data, b"persisted content");
 }
 
@@ -116,7 +116,7 @@ async fn wrong_passphrase_fails_to_decrypt() {
 
     // Re-open with wrong passphrase — salt is reused but KEK differs, so GCM auth fails.
     let engine2 = engine_with_passphrase(&dir, "wrong-pass").await;
-    let result = engine2.get("docs", id).await;
+    let result = engine2.get("docs", &id).await;
     assert!(result.is_err(), "decryption with wrong passphrase must fail");
 }
 
@@ -142,8 +142,8 @@ async fn disabled_item_is_stored_plaintext() {
         .unwrap();
 
     // Both must round-trip correctly.
-    let plain = engine.get("mixed", plain_id).await.unwrap().unwrap();
-    let enc   = engine.get("mixed", enc_id).await.unwrap().unwrap();
+    let plain = engine.get("mixed", &plain_id).await.unwrap().unwrap();
+    let enc   = engine.get("mixed", &enc_id).await.unwrap().unwrap();
     assert_eq!(plain.data, b"public data");
     assert_eq!(enc.data,   b"private data");
 }
@@ -179,7 +179,7 @@ async fn raw_key_reopens_and_decrypts() {
     };
 
     let engine2 = engine_with_raw_key(&dir, key).await;
-    let rec = engine2.get("notes", id).await.unwrap().unwrap();
+    let rec = engine2.get("notes", &id).await.unwrap().unwrap();
     assert_eq!(rec.data, b"reopen check");
 }
 
@@ -196,7 +196,7 @@ async fn wrong_raw_key_fails_to_decrypt() {
     };
 
     let engine2 = engine_with_raw_key(&dir, [0x22u8; 32]).await;
-    let result = engine2.get("notes", id).await;
+    let result = engine2.get("notes", &id).await;
     assert!(result.is_err(), "wrong raw key must fail to decrypt");
 }
 
@@ -206,14 +206,14 @@ async fn wrong_raw_key_fails_to_decrypt() {
 async fn explicit_id_preserved_after_encryption() {
     let dir    = tempdir().unwrap();
     let engine = engine_with_raw_key(&dir, raw_key()).await;
-    let id     = Ulid::new();
+    let id     = Ulid::new().to_string();
 
     engine
-        .put("notes", Some(id), b"known-id content".to_vec(), PutOpts::default())
+        .put("notes", Some(id.clone()), b"known-id content".to_vec(), PutOpts::default())
         .await
         .unwrap();
 
-    let rec = engine.get("notes", id).await.unwrap().unwrap();
+    let rec = engine.get("notes", &id).await.unwrap().unwrap();
     assert_eq!(rec.id, id);
     assert_eq!(rec.data, b"known-id content");
 }
@@ -230,6 +230,6 @@ async fn no_encryption_roundtrip_unchanged() {
         .await
         .unwrap();
 
-    let rec = engine.get("plain", id).await.unwrap().unwrap();
+    let rec = engine.get("plain", &id).await.unwrap().unwrap();
     assert_eq!(rec.data, b"unencrypted");
 }

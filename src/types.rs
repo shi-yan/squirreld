@@ -10,7 +10,7 @@ use crate::hlc::Hlc;
 /// A record returned by [`crate::SquirrelEngine::get`] — includes the full data payload.
 #[derive(Debug, Clone)]
 pub struct Record {
-    pub id: Ulid,
+    pub id: String,
     pub collection: String,
     /// Raw bytes as stored by the caller. Decrypted automatically when encryption is enabled.
     pub data: Vec<u8>,
@@ -24,7 +24,7 @@ pub struct Record {
 /// A record header returned by [`crate::SquirrelEngine::list`] — no data bytes.
 #[derive(Debug, Clone)]
 pub struct RecordMeta {
-    pub id: Ulid,
+    pub id: String,
     pub collection: String,
     pub hlc: Hlc,
     pub schema_version: u32,

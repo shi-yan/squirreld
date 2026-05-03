@@ -258,6 +258,16 @@ pub fn query(
 
 // ── Filter → SQL ──────────────────────────────────────────────────────────────
 
+/// Built-in columns that live on the `records` table (`r.`), not the shadow index.
+/// These are always addressed with `r.` even when a shadow index exists.
+const RECORD_COLUMNS: &[&str] = &[
+    "id", "hlc", "schema_version", "deleted", "created_at", "updated_at",
+];
+
+fn col_prefix<'a>(field: &str, has_shadow: bool) -> &'a str {
+    if !has_shadow || RECORD_COLUMNS.contains(&field) { "r." } else { "s." }
+}
+
 fn build_filter_sql(
     filter: &QueryFilter,
     collection: &str,
@@ -268,31 +278,31 @@ fn build_filter_sql(
     match filter {
         QueryFilter::Eq { field, value } => {
             let col = sanitize_ident(field)?;
-            let prefix = if has_shadow { "s." } else { "r." };
+            let prefix = col_prefix(field, has_shadow);
             params.push(to_sql_value(value));
             Ok(format!("{prefix}{col} = ?{}", params.len()))
         }
         QueryFilter::Lt { field, value } => {
             let col = sanitize_ident(field)?;
-            let prefix = if has_shadow { "s." } else { "r." };
+            let prefix = col_prefix(field, has_shadow);
             params.push(to_sql_value(value));
             Ok(format!("{prefix}{col} < ?{}", params.len()))
         }
         QueryFilter::Gt { field, value } => {
             let col = sanitize_ident(field)?;
-            let prefix = if has_shadow { "s." } else { "r." };
+            let prefix = col_prefix(field, has_shadow);
             params.push(to_sql_value(value));
             Ok(format!("{prefix}{col} > ?{}", params.len()))
         }
         QueryFilter::Le { field, value } => {
             let col = sanitize_ident(field)?;
-            let prefix = if has_shadow { "s." } else { "r." };
+            let prefix = col_prefix(field, has_shadow);
             params.push(to_sql_value(value));
             Ok(format!("{prefix}{col} <= ?{}", params.len()))
         }
         QueryFilter::Ge { field, value } => {
             let col = sanitize_ident(field)?;
-            let prefix = if has_shadow { "s." } else { "r." };
+            let prefix = col_prefix(field, has_shadow);
             params.push(to_sql_value(value));
             Ok(format!("{prefix}{col} >= ?{}", params.len()))
         }

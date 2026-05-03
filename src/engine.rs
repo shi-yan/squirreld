@@ -24,19 +24,19 @@ use crate::{
 enum Command {
     Put {
         collection: String,
-        id: Option<Ulid>,
+        id: Option<String>,
         data: Vec<u8>,
         opts: PutOpts,
-        reply: oneshot::Sender<Result<Ulid>>,
+        reply: oneshot::Sender<Result<String>>,
     },
     Get {
         collection: String,
-        id: Ulid,
+        id: String,
         reply: oneshot::Sender<Result<Option<Record>>>,
     },
     Delete {
         collection: String,
-        id: Ulid,
+        id: String,
         reply: oneshot::Sender<Result<()>>,
     },
     List {
@@ -204,27 +204,30 @@ impl SquirrelEngine {
 
     // ── Record operations ───────────────────────────────────────────────────
 
+    /// Write a record. Pass `None` for `id` to generate a ULID automatically.
+    /// Pass `Some(key)` to use any string as the record key — content hashes, natural keys, etc.
+    /// The returned `String` is the key that was used (generated or supplied).
     pub async fn put(
         &self,
         collection: &str,
-        id: Option<Ulid>,
+        id: Option<String>,
         data: Vec<u8>,
         opts: PutOpts,
-    ) -> Result<Ulid> {
+    ) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::Put { collection: collection.into(), id, data, opts, reply: tx }).await?;
         rx.await.map_err(|_| SquirrelError::ActorClosed)?
     }
 
-    pub async fn get(&self, collection: &str, id: Ulid) -> Result<Option<Record>> {
+    pub async fn get(&self, collection: &str, id: &str) -> Result<Option<Record>> {
         let (tx, rx) = oneshot::channel();
-        self.send(Command::Get { collection: collection.into(), id, reply: tx }).await?;
+        self.send(Command::Get { collection: collection.into(), id: id.to_string(), reply: tx }).await?;
         rx.await.map_err(|_| SquirrelError::ActorClosed)?
     }
 
-    pub async fn delete(&self, collection: &str, id: Ulid) -> Result<()> {
+    pub async fn delete(&self, collection: &str, id: &str) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.send(Command::Delete { collection: collection.into(), id, reply: tx }).await?;
+        self.send(Command::Delete { collection: collection.into(), id: id.to_string(), reply: tx }).await?;
         rx.await.map_err(|_| SquirrelError::ActorClosed)?
     }
 
@@ -341,10 +344,10 @@ async fn actor_loop(mut rx: mpsc::Receiver<Command>, mut state: ActorState) {
                 let _ = reply.send(result);
             }
             Command::Get { collection, id, reply } => {
-                let _ = reply.send(handle_get(&state, &collection, id));
+                let _ = reply.send(handle_get(&state, &collection, &id));
             }
             Command::Delete { collection, id, reply } => {
-                let result = handle_delete(&mut state, &collection, id);
+                let result = handle_delete(&mut state, &collection, &id);
                 if result.is_ok() { kick_sync(&state); }
                 let _ = reply.send(result);
             }
@@ -399,11 +402,11 @@ fn kick_sync(state: &ActorState) {
 fn handle_put(
     state: &mut ActorState,
     collection: String,
-    id: Option<Ulid>,
+    id: Option<String>,
     data: Vec<u8>,
     opts: PutOpts,
-) -> Result<Ulid> {
-    let id  = id.unwrap_or_else(Ulid::new);
+) -> Result<String> {
+    let id  = id.unwrap_or_else(|| Ulid::new().to_string());
     let hlc = state.last_hlc.tick();
     let now = now_ms();
 
@@ -412,7 +415,7 @@ fn handle_put(
 
     let tx = state.conn.transaction()?;
     db::records::upsert(&tx, &RecordRow {
-        id:             id.to_string(),
+        id:             id.clone(),
         collection:     collection.clone(),
         data:           stored_data,
         hlc:            hlc.to_string(),
@@ -424,16 +427,15 @@ fn handle_put(
         created_at:     now,
         updated_at:     now,
     })?;
-    // Outbox always carries the plaintext so that remote peers receive readable data.
-    db::outbox::append(&tx, &id.to_string(), &collection, "upsert", &hlc.to_string(), Some(&data))?;
+    db::outbox::append(&tx, &id, &collection, "upsert", &hlc.to_string(), Some(&data))?;
 
     // Maintain shadow index if registered for this collection.
     if let Some(def) = state.indexes.get(&collection) {
         if !opts.index_fields.is_empty() || !def.fields.is_empty() {
-            db::index::upsert_index_row(&tx, def, &id.to_string(), &opts.index_fields)?;
+            db::index::upsert_index_row(&tx, def, &id, &opts.index_fields)?;
         }
         if !def.fts_fields.is_empty() {
-            db::index::upsert_fts_row(&tx, def, &id.to_string(), &opts.index_fields)?;
+            db::index::upsert_fts_row(&tx, def, &id, &opts.index_fields)?;
         }
     }
 
@@ -442,22 +444,22 @@ fn handle_put(
     Ok(id)
 }
 
-fn handle_get(state: &ActorState, collection: &str, id: Ulid) -> Result<Option<Record>> {
-    let row = db::records::get(&state.conn, collection, &id.to_string())?;
+fn handle_get(state: &ActorState, collection: &str, id: &str) -> Result<Option<Record>> {
+    let row = db::records::get(&state.conn, collection, id)?;
     row.filter(|r| !r.deleted)
        .map(|r| maybe_decrypt(&state.kek, r).map(to_record))
        .transpose()
 }
 
-fn handle_delete(state: &mut ActorState, collection: &str, id: Ulid) -> Result<()> {
+fn handle_delete(state: &mut ActorState, collection: &str, id: &str) -> Result<()> {
     let hlc = state.last_hlc.tick();
     let now = now_ms();
     let tx  = state.conn.transaction()?;
-    db::records::soft_delete(&tx, collection, &id.to_string(), &hlc.to_string(), now)?;
-    db::outbox::append(&tx, &id.to_string(), collection, "delete", &hlc.to_string(), None)?;
+    db::records::soft_delete(&tx, collection, id, &hlc.to_string(), now)?;
+    db::outbox::append(&tx, id, collection, "delete", &hlc.to_string(), None)?;
 
     if let Some(def) = state.indexes.get(collection) {
-        db::index::delete_index_rows(&tx, def, &id.to_string())?;
+        db::index::delete_index_rows(&tx, def, id)?;
     }
 
     tx.commit()?;
@@ -664,7 +666,7 @@ fn handle_query(state: &ActorState, collection: &str, opts: QueryOpts) -> Result
 
 fn to_record(r: RecordRow) -> Record {
     Record {
-        id:             r.id.parse().unwrap_or_else(|_| Ulid::new()),
+        id:             r.id,
         collection:     r.collection,
         data:           r.data,
         hlc:            r.hlc.parse().unwrap_or_else(|_| Hlc::new([0; 6])),
@@ -677,7 +679,7 @@ fn to_record(r: RecordRow) -> Record {
 
 fn to_meta(r: RecordRow) -> RecordMeta {
     RecordMeta {
-        id:             r.id.parse().unwrap_or_else(|_| Ulid::new()),
+        id:             r.id,
         collection:     r.collection,
         hlc:            r.hlc.parse().unwrap_or_else(|_| Hlc::new([0; 6])),
         schema_version: r.schema_version,

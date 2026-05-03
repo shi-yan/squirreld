@@ -66,7 +66,7 @@ async fn push_then_delete_both_synced() {
         .unwrap();
     engine.force_sync().await.unwrap();
 
-    engine.delete("papers", id).await.unwrap();
+    engine.delete("papers", &id).await.unwrap();
     let stats = engine.force_sync().await.unwrap();
     assert_eq!(stats.pushed, 1, "delete should push a tombstone");
     assert_eq!(stats.errors, 0);
@@ -106,11 +106,11 @@ async fn lww_remote_wins_when_it_has_higher_hlc() {
     let (engine_a, _dir_a) = engine_with_store(store.clone()).await;
     let (engine_b, _dir_b) = engine_with_store(store).await;
 
-    let explicit_id = Ulid::new();
+    let explicit_id = Ulid::new().to_string();
 
     // A writes first.
     engine_a
-        .put("papers", Some(explicit_id), b"from A".to_vec(), PutOpts::default())
+        .put("papers", Some(explicit_id.clone()), b"from A".to_vec(), PutOpts::default())
         .await
         .unwrap();
 
@@ -119,7 +119,7 @@ async fn lww_remote_wins_when_it_has_higher_hlc() {
 
     // B writes the same record ID — B's HLC will be higher.
     engine_b
-        .put("papers", Some(explicit_id), b"from B".to_vec(), PutOpts::default())
+        .put("papers", Some(explicit_id.clone()), b"from B".to_vec(), PutOpts::default())
         .await
         .unwrap();
 
@@ -132,7 +132,7 @@ async fn lww_remote_wins_when_it_has_higher_hlc() {
     assert_eq!(stats_a.conflicts, 1, "A's push should be rejected (B has higher HLC)");
 
     // After pull, A must hold B's winning version.
-    let rec = engine_a.get("papers", explicit_id).await.unwrap().unwrap();
+    let rec = engine_a.get("papers", &explicit_id).await.unwrap().unwrap();
     assert_eq!(rec.data, b"from B", "A should have adopted B's version");
 }
 
@@ -142,11 +142,11 @@ async fn lww_local_wins_when_it_has_higher_hlc() {
     let (engine_a, _dir_a) = engine_with_store(store.clone()).await;
     let (engine_b, _dir_b) = engine_with_store(store).await;
 
-    let explicit_id = Ulid::new();
+    let explicit_id = Ulid::new().to_string();
 
     // B writes first (older HLC).
     engine_b
-        .put("papers", Some(explicit_id), b"from B (old)".to_vec(), PutOpts::default())
+        .put("papers", Some(explicit_id.clone()), b"from B (old)".to_vec(), PutOpts::default())
         .await
         .unwrap();
     // B syncs — its version is now on the remote.
@@ -155,7 +155,7 @@ async fn lww_local_wins_when_it_has_higher_hlc() {
     // A writes the same record later (higher HLC).
     tokio::time::sleep(Duration::from_millis(5)).await;
     engine_a
-        .put("papers", Some(explicit_id), b"from A (new)".to_vec(), PutOpts::default())
+        .put("papers", Some(explicit_id.clone()), b"from A (new)".to_vec(), PutOpts::default())
         .await
         .unwrap();
 
@@ -166,7 +166,7 @@ async fn lww_local_wins_when_it_has_higher_hlc() {
 
     // B pulls — B must now hold A's version.
     engine_b.force_sync().await.unwrap();
-    let rec_b = engine_b.get("papers", explicit_id).await.unwrap().unwrap();
+    let rec_b = engine_b.get("papers", &explicit_id).await.unwrap().unwrap();
     assert_eq!(rec_b.data, b"from A (new)");
 }
 
@@ -185,16 +185,16 @@ async fn tombstone_propagates_to_second_device() {
         .unwrap();
     engine_a.force_sync().await.unwrap();
     engine_b.force_sync().await.unwrap();
-    assert!(engine_b.get("papers", id).await.unwrap().is_some(), "B should have the record");
+    assert!(engine_b.get("papers", &id).await.unwrap().is_some(), "B should have the record");
 
     // A deletes and syncs the tombstone.
-    engine_a.delete("papers", id).await.unwrap();
+    engine_a.delete("papers", &id).await.unwrap();
     engine_a.force_sync().await.unwrap();
 
     // B pulls the tombstone.
     engine_b.force_sync().await.unwrap();
     assert!(
-        engine_b.get("papers", id).await.unwrap().is_none(),
+        engine_b.get("papers", &id).await.unwrap().is_none(),
         "B should see the record as deleted"
     );
 }
@@ -207,14 +207,14 @@ async fn two_devices_converge_after_concurrent_writes() {
     let (engine_a, _dir_a) = engine_with_store(store.clone()).await;
     let (engine_b, _dir_b) = engine_with_store(store).await;
 
-    let id = Ulid::new();
+    let id = Ulid::new().to_string();
     engine_a
-        .put("papers", Some(id), b"version A".to_vec(), PutOpts::default())
+        .put("papers", Some(id.clone()), b"version A".to_vec(), PutOpts::default())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
     engine_b
-        .put("papers", Some(id), b"version B".to_vec(), PutOpts::default())
+        .put("papers", Some(id.clone()), b"version B".to_vec(), PutOpts::default())
         .await
         .unwrap();
 
@@ -224,8 +224,8 @@ async fn two_devices_converge_after_concurrent_writes() {
         engine_b.force_sync().await.unwrap();
     }
 
-    let rec_a = engine_a.get("papers", id).await.unwrap().unwrap();
-    let rec_b = engine_b.get("papers", id).await.unwrap().unwrap();
+    let rec_a = engine_a.get("papers", &id).await.unwrap().unwrap();
+    let rec_b = engine_b.get("papers", &id).await.unwrap().unwrap();
     assert_eq!(rec_a.data, rec_b.data, "both devices must converge to the same value");
     // B wrote 5ms later so its HLC is higher → B should win.
     assert_eq!(rec_a.data, b"version B");

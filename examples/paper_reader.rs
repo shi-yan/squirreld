@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     }).await?;
     for meta in &recent {
-        let rec = engine.get("papers", meta.id).await?.unwrap();
+        let rec = engine.get("papers", &meta.id).await?.unwrap();
         let p: Paper = serde_json::from_slice(&rec.data)?;
         println!("  {} ({})", p.title, p.year);
     }
@@ -145,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     }).await?;
     for meta in &hits {
-        let rec = engine.get("papers", meta.id).await?.unwrap();
+        let rec = engine.get("papers", &meta.id).await?.unwrap();
         let p: Paper = serde_json::from_slice(&rec.data)?;
         println!("  {}", p.title);
     }
@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     }).await?;
     for meta in &combined {
-        let rec = engine.get("papers", meta.id).await?.unwrap();
+        let rec = engine.get("papers", &meta.id).await?.unwrap();
         let p: Paper = serde_json::from_slice(&rec.data)?;
         println!("  {}", p.title);
     }
@@ -194,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await?;
 
-    let rec = engine2.get("papers", paper_ids[0]).await?.unwrap();
+    let rec = engine2.get("papers", &paper_ids[0]).await?.unwrap();
     let p: Paper = serde_json::from_slice(&rec.data)?;
     println!("re-opened and decrypted: \"{}\"", p.title);
 
@@ -203,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
         encryption: ItemEncryption::Disabled,
         ..Default::default()
     }).await?;
-    let public = engine2.get("papers", public_id).await?.unwrap();
+    let public = engine2.get("papers", &public_id).await?.unwrap();
     assert_eq!(public.data, b"public abstract");
     println!("plaintext override record read back correctly");
 

@@ -212,7 +212,7 @@ async fn deleted_record_absent_from_query() {
         ..Default::default()
     }).await.unwrap();
 
-    engine.delete("papers", id).await.unwrap();
+    engine.delete("papers", &id).await.unwrap();
 
     let results = engine.query("papers", QueryOpts {
         filter: Some(QueryFilter::Eq { field: "year".into(), value: IndexValue::Integer(2022) }),
@@ -266,8 +266,8 @@ async fn put_with_explicit_id_indexes_correctly() {
     let (engine, _dir) = open_engine().await;
     engine.register_index(papers_index()).await.unwrap();
 
-    let id = Ulid::new();
-    engine.put("papers", Some(id), b"content".to_vec(), PutOpts {
+    let id = Ulid::new().to_string();
+    engine.put("papers", Some(id.clone()), b"content".to_vec(), PutOpts {
         index_fields: idx(&[
             ("year",  IndexValue::Integer(1999)),
             ("title", IndexValue::Text("classic paper".into())),
@@ -282,4 +282,40 @@ async fn put_with_explicit_id_indexes_correctly() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, id);
+}
+
+// ── schema_version is queryable without declaring it in IndexDef ──────────────
+
+#[tokio::test]
+async fn query_by_schema_version() {
+    let (engine, _dir) = open_engine().await;
+    engine.register_index(papers_index()).await.unwrap();
+
+    // Write records at different schema versions.
+    for v in [0u32, 0, 1, 2] {
+        engine.put("papers", None, b"x".to_vec(), PutOpts {
+            schema_version: Some(v),
+            ..Default::default()
+        }).await.unwrap();
+    }
+
+    // Records needing migration (schema_version < 1).
+    let outdated = engine.query("papers", QueryOpts {
+        filter: Some(QueryFilter::Lt {
+            field: "schema_version".into(),
+            value: IndexValue::Integer(1),
+        }),
+        ..Default::default()
+    }).await.unwrap();
+    assert_eq!(outdated.len(), 2, "two records at v0 need migration");
+
+    // Current schema.
+    let current = engine.query("papers", QueryOpts {
+        filter: Some(QueryFilter::Eq {
+            field: "schema_version".into(),
+            value: IndexValue::Integer(2),
+        }),
+        ..Default::default()
+    }).await.unwrap();
+    assert_eq!(current.len(), 1);
 }

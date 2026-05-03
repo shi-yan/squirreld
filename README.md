@@ -40,10 +40,11 @@ async fn main() -> squirreld::error::Result<()> {
         .await?;
 
     // Write a record (encrypted by default when a KEK is configured).
-    let id = engine.put("notes", None, b"Hello, squirreld!".to_vec(), PutOpts::default()).await?;
+    // `put` returns a String key — a ULID when None is passed.
+    let id: String = engine.put("notes", None, b"Hello, squirreld!".to_vec(), PutOpts::default()).await?;
 
     // Read it back (decrypted transparently).
-    let rec = engine.get("notes", id).await?.unwrap();
+    let rec = engine.get("notes", &id).await?.unwrap();
     assert_eq!(rec.data, b"Hello, squirreld!");
 
     engine.shutdown().await
@@ -64,7 +65,8 @@ async fn main() -> squirreld::error::Result<()> {
 8. [Sync events](#8-sync-events)
 9. [Testing with in-memory doubles](#9-testing-with-in-memory-doubles)
 10. [Feature flags](#10-feature-flags)
-11. [Design notes](#11-design-notes)
+11. [Schema migration](#schema-migration)
+12. [Design notes](#12-design-notes)
 
 ---
 
@@ -122,21 +124,32 @@ let engine = SquirrelEngine::builder()
 
 ### put
 
+Record keys are plain `String` values. Pass `None` to generate a ULID automatically, or `Some(key)` to use any string — ULIDs, UUIDs, content hashes, or natural keys.
+
 ```rust
 use squirreld::{PutOpts, Ulid};
 
-// Generate a new ID automatically.
-let id: Ulid = engine.put("papers", None, payload_bytes, PutOpts::default()).await?;
+// Generate a new ULID automatically.
+let id: String = engine.put("papers", None, payload_bytes, PutOpts::default()).await?;
 
-// Use a caller-supplied ID (idempotent upsert).
-let fixed_id = Ulid::new();
-engine.put("papers", Some(fixed_id), payload_bytes, PutOpts::default()).await?;
+// Use a caller-supplied ULID.
+let fixed_id = Ulid::new().to_string();
+engine.put("papers", Some(fixed_id.clone()), payload_bytes, PutOpts::default()).await?;
+
+// Content-addressed key — use a content hash for automatic deduplication.
+// Two devices that independently add the same PDF will write the same key
+// with the same content; LWW conflict resolution converges them silently.
+let hash_key = hex::encode(blake3::hash(&pdf_bytes).as_bytes());
+engine.put("pdfs", Some(hash_key.clone()), pdf_bytes, PutOpts::default()).await?;
+
+// Natural key — any unique string works.
+engine.put("users", Some("alice@example.com".into()), user_bytes, PutOpts::default()).await?;
 ```
 
 ### get
 
 ```rust
-match engine.get("papers", id).await? {
+match engine.get("papers", &id).await? {
     Some(record) => {
         // record.data is the plaintext bytes (decrypted transparently if encrypted).
         let paper: Paper = serde_json::from_slice(&record.data)?;
@@ -151,7 +164,7 @@ match engine.get("papers", id).await? {
 Soft-deletes the record. Tombstones propagate to other devices during sync.
 
 ```rust
-engine.delete("papers", id).await?;
+engine.delete("papers", &id).await?;
 ```
 
 ### list
@@ -254,6 +267,25 @@ Available filter variants: `Eq`, `Lt`, `Gt`, `Le`, `Ge`, `And`, `Or`, `Contains`
 
 `query()` returns `Vec<RecordMeta>` (headers only). Call `engine.get()` for the full payload.
 
+### Querying by schema_version
+
+`schema_version` is a built-in record field — no `IndexDef` declaration required. Use it directly in any filter to locate records that need migration:
+
+```rust
+use squirreld::{IndexValue, QueryFilter, QueryOpts};
+
+// Find every record still on schema v0.
+let outdated = engine.query("papers", QueryOpts {
+    filter: Some(QueryFilter::Lt {
+        field: "schema_version".into(),
+        value: IndexValue::Integer(2),
+    }),
+    ..Default::default()
+}).await?;
+```
+
+See [Schema migration](#schema-migration) below for the full migration pattern.
+
 ---
 
 ## 4. Full-text search (FTS5)
@@ -352,13 +384,13 @@ engine.put("papers", None, data, PutOpts::default()).await?;
 
 ### Sync and encryption
 
-The outbox always carries **plaintext** payloads. Remote peers receive unencrypted data and store it with `format_version = 0` — each device manages its own encryption independently. This means:
+The sync pipeline is end-to-end encrypted. When a record is stored with `format_version = 1`, the push cycle reads the **ciphertext** directly from the local records table and sends it — along with the wrapped DEK — to the remote backend. The server (DynamoDB, InMemoryStore, or any custom backend) only ever stores opaque encrypted bytes.
 
-- Two devices can sync even if only one has encryption enabled.
-- A device that loses its KEK can re-encrypt records retrieved from the cloud.
-- The remote backend (DynamoDB) never sees ciphertext by default.
+When a peer pulls and applies a remote record it stores `data` (still ciphertext) and `dek_encrypted` locally; decryption happens only on `get()`, using the device's own KEK. This means:
 
-If true E2E encryption is required — where the backend sees only ciphertext — encrypt the payload yourself before calling `put()` and pass `ItemEncryption::Disabled`.
+- The backend cannot read any record content.
+- Two devices that share a KEK (same passphrase or the same raw key) can both decrypt each other's records.
+- A device without the KEK can still pull and store records, but `get()` will return an error on any encrypted record.
 
 ---
 
@@ -554,7 +586,7 @@ async fn two_device_sync() {
         .build().await.unwrap();
 
     // A writes a record.
-    let id = engine_a.put("notes", None, b"hello".to_vec(), PutOpts::default())
+    let id: String = engine_a.put("notes", None, b"hello".to_vec(), PutOpts::default())
         .await.unwrap();
 
     // Sync: A pushes, B pulls.
@@ -562,7 +594,7 @@ async fn two_device_sync() {
     engine_b.force_sync().await.unwrap();
 
     // B has the record.
-    let rec = engine_b.get("notes", id).await.unwrap().unwrap();
+    let rec = engine_b.get("notes", &id).await.unwrap().unwrap();
     assert_eq!(rec.data, b"hello");
 }
 ```
@@ -589,7 +621,62 @@ squirreld = { version = "0.1", default-features = false, features = ["encryption
 
 ---
 
-## 11. Design notes
+## Schema migration
+
+Every record carries a `schema_version: u32` field (default `0`). The library stores and indexes it but assigns no meaning — migration logic lives entirely in your code.
+
+### Writing with a schema version
+
+```rust
+use squirreld::PutOpts;
+
+// Write a v1 record.
+engine.put("papers", None, payload_v1, PutOpts {
+    schema_version: Some(1),
+    ..Default::default()
+}).await?;
+```
+
+### Batch migration
+
+```rust
+use squirreld::{IndexValue, ListOpts, QueryFilter, QueryOpts};
+
+const CURRENT_VERSION: u32 = 2;
+
+// Query all records that are behind the current schema.
+let outdated = engine.query("papers", QueryOpts {
+    filter: Some(QueryFilter::Lt {
+        field: "schema_version".into(),
+        value: IndexValue::Integer(CURRENT_VERSION as i64),
+    }),
+    ..Default::default()
+}).await?;
+
+for meta in outdated {
+    // Fetch full payload.
+    let rec = engine.get("papers", &meta.id).await?.unwrap();
+
+    // Deserialise from old schema and re-serialise to new schema.
+    let migrated_payload: Vec<u8> = migrate_paper(&rec.data, meta.schema_version)?;
+
+    // Write back at the new schema version. The same record key is reused.
+    engine.put("papers", Some(meta.id), migrated_payload, PutOpts {
+        schema_version: Some(CURRENT_VERSION),
+        ..Default::default()
+    }).await?;
+}
+```
+
+### Design principles
+
+- **Lazy vs. eager**: run the loop at startup for eager migration, or only when you encounter a record with an old version for lazy migration.
+- **Sync safety**: migrated records get a new HLC. If two devices migrate concurrently the LWW rule applies — the last migration written wins. In practice this is harmless when the transformation is deterministic.
+- **No library involvement**: squirreld intentionally knows nothing about your schema. It just stores the version number and lets you query it.
+
+---
+
+## 12. Design notes
 
 ### Hybrid Logical Clock
 
