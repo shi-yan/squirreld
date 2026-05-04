@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use tracing::{debug, warn};
 use aws_sdk_s3::{
     Client,
     types::{
@@ -53,20 +54,19 @@ impl BlobBackend for S3Backend {
     fn backend_id(&self) -> &str { &self.bucket_name }
 
     async fn ensure_bucket(&self) -> Result<(), BackendError> {
-        // HEAD bucket — succeeds if it exists, fails if not
-        let result = self.client
-            .head_bucket()
-            .bucket(&self.bucket_name)
-            .send()
-            .await;
-        if result.is_ok() { return Ok(()); }
+        match self.client.head_bucket().bucket(&self.bucket_name).send().await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let detail = format!("{e:#?}");
+                if detail.contains("403") || detail.contains("AccessDenied") || detail.contains("Forbidden") {
+                    warn!(bucket = %self.bucket_name, "head_bucket failed (check IAM permissions): {detail}");
+                    return Err(BackendError::Config(format!("head_bucket: {detail}")));
+                }
+                debug!(bucket = %self.bucket_name, "bucket not found, will attempt create_bucket");
+            }
+        }
 
-        // us-east-1 is S3's default region and must NOT include a
-        // LocationConstraint. All other regions require one.
-        let mut req = self.client
-            .create_bucket()
-            .bucket(&self.bucket_name);
-
+        let mut req = self.client.create_bucket().bucket(&self.bucket_name);
         if self.region != "us-east-1" {
             let constraint = BucketLocationConstraint::from(self.region.as_str());
             let cfg = CreateBucketConfiguration::builder()
@@ -74,10 +74,9 @@ impl BlobBackend for S3Backend {
                 .build();
             req = req.create_bucket_configuration(cfg);
         }
-
         req.send()
             .await
-            .map_err(|e| BackendError::Config(e.to_string()))?;
+            .map_err(|e| BackendError::Config(format!("create_bucket: {e:#?}")))?;
         Ok(())
     }
 
@@ -89,7 +88,7 @@ impl BlobBackend for S3Backend {
             .body(data.into())
             .send()
             .await
-            .map_err(|e| BackendError::Transient(e.to_string()))?;
+            .map_err(|e| BackendError::Transient(format!("{e:#?}")))?;
         Ok(())
     }
 
@@ -100,7 +99,7 @@ impl BlobBackend for S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| BackendError::Transient(e.to_string()))?;
+            .map_err(|e| BackendError::Transient(format!("{e:#?}")))?;
 
         resp.upload_id()
             .map(|s| s.to_string())
@@ -123,7 +122,7 @@ impl BlobBackend for S3Backend {
             .body(data.into())
             .send()
             .await
-            .map_err(|e| BackendError::Transient(e.to_string()))?;
+            .map_err(|e| BackendError::Transient(format!("{e:#?}")))?;
 
         resp.e_tag()
             .map(|s| s.to_string())
@@ -156,7 +155,7 @@ impl BlobBackend for S3Backend {
                 Ok(parts)
             }
             Err(e) => {
-                let msg = e.to_string();
+                let msg = format!("{e:#?}");
                 // NoSuchUpload means the upload ID expired — caller resets and retries.
                 if msg.contains("NoSuchUpload") {
                     Ok(vec![])
@@ -195,7 +194,7 @@ impl BlobBackend for S3Backend {
             .multipart_upload(upload)
             .send()
             .await
-            .map_err(|e| BackendError::Transient(e.to_string()))?;
+            .map_err(|e| BackendError::Transient(format!("{e:#?}")))?;
         Ok(())
     }
 
@@ -206,15 +205,15 @@ impl BlobBackend for S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| BackendError::Transient(e.to_string()))?;
+            .map_err(|e| BackendError::Transient(format!("{e:#?}")))?;
 
         let data = resp.body.collect().await
-            .map_err(|e| BackendError::Transient(e.to_string()))?
+            .map_err(|e| BackendError::Transient(format!("{e:#?}")))?
             .into_bytes();
         let len = data.len() as u64;
 
         tokio::fs::write(dest, data).await
-            .map_err(|e| BackendError::Transient(e.to_string()))?;
+            .map_err(|e| BackendError::Transient(format!("{e:#?}")))?;
         Ok(len)
     }
 
@@ -225,7 +224,7 @@ impl BlobBackend for S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| BackendError::Transient(e.to_string()))?;
+            .map_err(|e| BackendError::Transient(format!("{e:#?}")))?;
         Ok(())
     }
 }

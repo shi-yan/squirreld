@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use tracing::{debug, warn};
 use aws_sdk_dynamodb::{
     Client,
     types::{
@@ -127,7 +128,7 @@ impl RecordBackend for DynamoDbBackend {
         match result {
             Ok(_) => PushResult::Ok { pushed_seqs: vec![entry.seq] },
             Err(e) => {
-                let err_str = e.to_string();
+                let err_str = format!("{e:#?}");
                 // DynamoDB returns ConditionalCheckFailedException when condition fails.
                 if err_str.contains("ConditionalCheckFailedException") {
                     PushResult::ConflictAt { record_id: entry.record_id.clone(), seq: entry.seq }
@@ -167,7 +168,7 @@ impl RecordBackend for DynamoDbBackend {
             }
 
             let resp = req.send().await
-                .map_err(|e| BackendError::Transient(e.to_string()))?;
+                .map_err(|e| BackendError::Transient(format!("{e:#?}")))?;
 
             for item in resp.items() {
                 if let Some(r) = Self::remote_record_from_item(item) {
@@ -183,15 +184,16 @@ impl RecordBackend for DynamoDbBackend {
     }
 
     async fn ensure_table(&self) -> Result<(), BackendError> {
-        // Check if the table already exists.
-        let describe = self.client
-            .describe_table()
-            .table_name(&self.table_name)
-            .send()
-            .await;
-
-        if describe.is_ok() {
-            return Ok(()); // table already exists
+        match self.client.describe_table().table_name(&self.table_name).send().await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let detail = format!("{e:#?}");
+                if !detail.contains("ResourceNotFoundException") {
+                    warn!(table = %self.table_name, "describe_table failed: {detail}");
+                    return Err(BackendError::Config(format!("describe_table: {detail}")));
+                }
+                debug!(table = %self.table_name, "table not found, will attempt create_table");
+            }
         }
 
         // Create the table with a GSI for range-query pulls.
@@ -270,7 +272,7 @@ impl RecordBackend for DynamoDbBackend {
             )
             .send()
             .await
-            .map_err(|e| BackendError::Config(e.to_string()))?;
+            .map_err(|e| BackendError::Config(format!("create_table: {e:#?}")))?;
 
         Ok(())
     }
