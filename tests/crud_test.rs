@@ -21,7 +21,7 @@ async fn put_and_get_roundtrip() {
         .put("papers", None, data.to_vec(), PutOpts::default())
         .await
         .unwrap();
-    let record = engine.get("papers", id).await.unwrap().unwrap();
+    let record = engine.get("papers", &id).await.unwrap().unwrap();
     assert_eq!(record.data, data);
     assert_eq!(record.collection, "papers");
     assert_eq!(record.id, id);
@@ -31,13 +31,13 @@ async fn put_and_get_roundtrip() {
 #[tokio::test]
 async fn put_with_explicit_id() {
     let (engine, _dir) = open_engine().await;
-    let explicit_id = Ulid::new();
+    let explicit_id = Ulid::new().to_string();
     let returned_id = engine
-        .put("papers", Some(explicit_id), b"data".to_vec(), PutOpts::default())
+        .put("papers", Some(explicit_id.clone()), b"data".to_vec(), PutOpts::default())
         .await
         .unwrap();
     assert_eq!(returned_id, explicit_id);
-    assert!(engine.get("papers", explicit_id).await.unwrap().is_some());
+    assert!(engine.get("papers", &explicit_id).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -48,10 +48,10 @@ async fn put_same_id_twice_updates_record() {
         .await
         .unwrap();
     engine
-        .put("papers", Some(id), b"v2".to_vec(), PutOpts::default())
+        .put("papers", Some(id.clone()), b"v2".to_vec(), PutOpts::default())
         .await
         .unwrap();
-    let record = engine.get("papers", id).await.unwrap().unwrap();
+    let record = engine.get("papers", &id).await.unwrap().unwrap();
     assert_eq!(record.data, b"v2");
 }
 
@@ -62,13 +62,13 @@ async fn put_preserves_created_at_on_update() {
         .put("papers", None, b"v1".to_vec(), PutOpts::default())
         .await
         .unwrap();
-    let original = engine.get("papers", id).await.unwrap().unwrap();
+    let original = engine.get("papers", &id).await.unwrap().unwrap();
 
     engine
-        .put("papers", Some(id), b"v2".to_vec(), PutOpts::default())
+        .put("papers", Some(id.clone()), b"v2".to_vec(), PutOpts::default())
         .await
         .unwrap();
-    let updated = engine.get("papers", id).await.unwrap().unwrap();
+    let updated = engine.get("papers", &id).await.unwrap().unwrap();
 
     assert_eq!(original.created_at, updated.created_at, "created_at must not change on update");
     assert!(updated.updated_at >= original.updated_at, "updated_at must advance");
@@ -77,7 +77,7 @@ async fn put_preserves_created_at_on_update() {
 #[tokio::test]
 async fn get_nonexistent_returns_none() {
     let (engine, _dir) = open_engine().await;
-    let result = engine.get("papers", Ulid::new()).await.unwrap();
+    let result = engine.get("papers", &Ulid::new().to_string()).await.unwrap();
     assert!(result.is_none());
 }
 
@@ -88,8 +88,8 @@ async fn delete_makes_get_return_none() {
         .put("papers", None, b"data".to_vec(), PutOpts::default())
         .await
         .unwrap();
-    engine.delete("papers", id).await.unwrap();
-    assert!(engine.get("papers", id).await.unwrap().is_none());
+    engine.delete("papers", &id).await.unwrap();
+    assert!(engine.get("papers", &id).await.unwrap().is_none());
 }
 
 // ── List ─────────────────────────────────────────────────────────────────────
@@ -108,8 +108,8 @@ async fn list_returns_records_in_hlc_desc_order() {
     let results = engine.list("papers", ListOpts::default()).await.unwrap();
     assert_eq!(results.len(), 5);
     // HLC desc means most recently written first.
-    assert_eq!(results[0].id, *ids.last().unwrap());
-    assert_eq!(results[4].id, ids[0]);
+    assert_eq!(results[0].id, ids.last().unwrap().as_str());
+    assert_eq!(results[4].id, ids[0].as_str());
 }
 
 #[tokio::test]
@@ -123,7 +123,7 @@ async fn list_excludes_deleted_by_default() {
         .put("papers", None, b"b".to_vec(), PutOpts::default())
         .await
         .unwrap();
-    engine.delete("papers", id1).await.unwrap();
+    engine.delete("papers", &id1).await.unwrap();
 
     let results = engine.list("papers", ListOpts::default()).await.unwrap();
     assert_eq!(results.len(), 1, "deleted record should be excluded");
@@ -137,7 +137,7 @@ async fn list_includes_deleted_when_requested() {
         .put("papers", None, b"data".to_vec(), PutOpts::default())
         .await
         .unwrap();
-    engine.delete("papers", id).await.unwrap();
+    engine.delete("papers", &id).await.unwrap();
 
     let opts = ListOpts { include_deleted: true, ..Default::default() };
     let results = engine.list("papers", opts).await.unwrap();
@@ -185,7 +185,7 @@ async fn hlc_is_monotonically_increasing() {
             .put("papers", None, format!("doc{i}").into_bytes(), PutOpts::default())
             .await
             .unwrap();
-        let record = engine.get("papers", id).await.unwrap().unwrap();
+        let record = engine.get("papers", &id).await.unwrap().unwrap();
         hlcs.push(record.hlc);
     }
     for i in 1..hlcs.len() {
@@ -208,7 +208,7 @@ async fn hlc_advances_after_engine_reopen() {
             .put("papers", None, b"v1".to_vec(), PutOpts::default())
             .await
             .unwrap();
-        let hlc = engine.get("papers", id).await.unwrap().unwrap().hlc;
+        let hlc = engine.get("papers", &id).await.unwrap().unwrap().hlc;
         engine.shutdown().await.unwrap();
         hlc
     };
@@ -223,7 +223,7 @@ async fn hlc_advances_after_engine_reopen() {
         .put("papers", None, b"v2".to_vec(), PutOpts::default())
         .await
         .unwrap();
-    let new_hlc = engine2.get("papers", id2).await.unwrap().unwrap().hlc;
+    let new_hlc = engine2.get("papers", &id2).await.unwrap().unwrap().hlc;
     assert!(new_hlc > last_hlc, "HLC after reopen must exceed last persisted HLC");
 }
 
@@ -249,8 +249,6 @@ async fn clear_error_removes_stuck_entry() {
         .put("papers", None, b"data".to_vec(), PutOpts::default())
         .await
         .unwrap();
-    // Directly manipulate the DB to simulate a retry — access via builder path.
-    // We can't test mark_retry through the public API in Phase 1 (sync is Phase 2).
     // Verify clear_error is a no-op when seq doesn't exist.
     engine.clear_error(999).await.unwrap();
 }
@@ -266,7 +264,7 @@ async fn records_in_different_collections_are_isolated() {
         .unwrap();
 
     // Same ID in a different collection must not be visible.
-    assert!(engine.get("notes", id).await.unwrap().is_none());
+    assert!(engine.get("notes", &id).await.unwrap().is_none());
     assert!(engine.list("notes", ListOpts::default()).await.unwrap().is_empty());
 }
 

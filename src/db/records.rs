@@ -12,7 +12,7 @@ pub(crate) struct RecordRow {
     pub format_version: u8,
     pub dek_encrypted: Option<Vec<u8>>,
     pub deleted: bool,
-    #[allow(dead_code)] // used in Phase 2 sync loop and Phase 5 encryption
+    #[allow(dead_code)] // used by upsert_remote and Phase 5 encryption
     pub synced: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -43,6 +43,42 @@ pub fn upsert(conn: &Connection, row: &RecordRow) -> Result<()> {
             row.schema_version as i64,
             row.format_version as i64,
             &row.dek_encrypted,
+            row.created_at,
+            row.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert or update a record received from a remote backend.
+/// Unlike [`upsert`], this preserves the remote `deleted` flag and marks the
+/// record as `synced = 1` (it's already on the server).
+/// `created_at` is preserved on conflict (same rule as `upsert`).
+pub fn upsert_remote(conn: &Connection, row: &RecordRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO records
+             (id, collection, data, hlc, schema_version, format_version,
+              dek_encrypted, deleted, synced, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10)
+         ON CONFLICT(id) DO UPDATE SET
+             collection     = excluded.collection,
+             data           = excluded.data,
+             hlc            = excluded.hlc,
+             schema_version = excluded.schema_version,
+             format_version = excluded.format_version,
+             dek_encrypted  = excluded.dek_encrypted,
+             deleted        = excluded.deleted,
+             synced         = 1,
+             updated_at     = excluded.updated_at",
+        rusqlite::params![
+            &row.id,
+            &row.collection,
+            &row.data,
+            &row.hlc,
+            row.schema_version as i64,
+            row.format_version as i64,
+            &row.dek_encrypted,
+            row.deleted as i64,
             row.created_at,
             row.updated_at,
         ],
@@ -108,6 +144,10 @@ pub fn max_hlc(conn: &Connection) -> Result<Option<String>> {
         .optional()
         .map(|o| o.flatten())
         .map_err(Into::into)
+}
+
+pub(crate) fn from_row_pub(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecordRow> {
+    from_row(r)
 }
 
 fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecordRow> {
