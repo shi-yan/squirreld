@@ -1,4 +1,3 @@
-use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{Result, SquirrelError};
@@ -15,8 +14,9 @@ pub fn get_or_create_node_id(conn: &Connection) -> Result<[u8; 6]> {
         arr.copy_from_slice(&bytes);
         Ok(arr)
     } else {
+        use rand::RngExt;
         let mut node_id = [0u8; 6];
-        rand::thread_rng().fill_bytes(&mut node_id);
+        rand::rng().fill(&mut node_id[..]);
         set(conn, "node_id", &hex_encode(&node_id))?;
         Ok(node_id)
     }
@@ -53,9 +53,9 @@ pub fn get_or_create_kek_salt(conn: &Connection) -> Result<[u8; 16]> {
         arr.copy_from_slice(&bytes);
         Ok(arr)
     } else {
-        use rand::RngCore;
+        use rand::RngExt;
         let mut salt = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rng().fill(&mut salt[..]);
         set(conn, "kek_salt", &hex_encode(&salt))?;
         Ok(salt)
     }

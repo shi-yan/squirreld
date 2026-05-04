@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
     let pdf_path = dir.path().join("paper.pdf");
     std::fs::write(&pdf_path, b"%PDF-1.4 fake pdf content for demo")?;
 
-    let blob_id = engine.put_blob(&pdf_path, PutBlobOpts {
+    let blob_id = engine.put_blob(None, &pdf_path, PutBlobOpts {
         record_id:  Some(paper_ids[0].to_string()),
         collection: Some("papers".into()),
     }).await?;

@@ -56,16 +56,16 @@ mod inner {
     }
 
     pub fn random_key() -> [u8; 32] {
-        use rand::RngCore;
+        use rand::RngExt;
         let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill(&mut key[..]);
         key
     }
 
     pub fn random_salt() -> [u8; 16] {
-        use rand::RngCore;
+        use rand::RngExt;
         let mut salt = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rng().fill(&mut salt[..]);
         salt
     }
 

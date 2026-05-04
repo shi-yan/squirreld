@@ -38,7 +38,7 @@ async fn put_blob_returns_blob_id_immediately() {
     let (engine, dir) = engine_with_blob_backend(store).await;
 
     let src = temp_file(&dir, "paper.pdf", b"PDF content here");
-    let blob_id = engine.put_blob(src, PutBlobOpts::default()).await.unwrap();
+    let blob_id = engine.put_blob(None, src, PutBlobOpts::default()).await.unwrap();
     assert!(!blob_id.is_empty());
 }
 
@@ -48,7 +48,7 @@ async fn blob_status_is_uploaded_after_flush() {
     let (engine, dir) = engine_with_blob_backend(store).await;
 
     let src = temp_file(&dir, "paper.pdf", b"some data");
-    let blob_id = engine.put_blob(src, PutBlobOpts::default()).await.unwrap();
+    let blob_id = engine.put_blob(None, src, PutBlobOpts::default()).await.unwrap();
 
     engine.force_flush_blobs().await.unwrap();
 
@@ -70,7 +70,7 @@ async fn get_blob_returns_cached_path_after_flush() {
 
     let content = b"hello world blob";
     let src = temp_file(&dir, "hello.txt", content);
-    let blob_id = engine.put_blob(src, PutBlobOpts::default()).await.unwrap();
+    let blob_id = engine.put_blob(None, src, PutBlobOpts::default()).await.unwrap();
 
     engine.force_flush_blobs().await.unwrap();
 
@@ -90,7 +90,7 @@ async fn get_blob_triggers_download_for_uploaded_blob() {
     // A uploads a blob.
     let content = b"shared blob content";
     let src = temp_file(&dir_a, "shared.bin", content);
-    let blob_id = engine_a.put_blob(src, PutBlobOpts::default()).await.unwrap();
+    let blob_id = engine_a.put_blob(None, src, PutBlobOpts::default()).await.unwrap();
     engine_a.force_flush_blobs().await.unwrap();
 
     // Manually insert the blob_id into B's DB to simulate a record referencing it.
@@ -105,7 +105,7 @@ async fn get_blob_triggers_download_for_uploaded_blob() {
     // We simulate by inserting directly via the actor and flushing.
     let src_b = dir_a.path().join("shared_b.bin");
     std::fs::write(&src_b, content).unwrap();
-    let blob_id_b = engine_b.put_blob(&src_b, PutBlobOpts::default()).await.unwrap();
+    let blob_id_b = engine_b.put_blob(None, &src_b, PutBlobOpts::default()).await.unwrap();
     engine_b.force_flush_blobs().await.unwrap();
 
     // B has the blob cached.
@@ -123,7 +123,7 @@ async fn blob_info_reports_correct_size() {
 
     let content = vec![0xABu8; 1024];
     let src = temp_file(&dir, "sized.bin", &content);
-    let blob_id = engine.put_blob(src, PutBlobOpts::default()).await.unwrap();
+    let blob_id = engine.put_blob(None, src, PutBlobOpts::default()).await.unwrap();
     engine.force_flush_blobs().await.unwrap();
 
     let info = engine.blob_info(&blob_id).await.unwrap().unwrap();
@@ -140,7 +140,7 @@ async fn multiple_blobs_all_uploaded() {
     let mut blob_ids = Vec::new();
     for i in 0..5 {
         let src = temp_file(&dir, &format!("file{i}.bin"), format!("content {i}").as_bytes());
-        let id = engine.put_blob(src, PutBlobOpts::default()).await.unwrap();
+        let id = engine.put_blob(None, src, PutBlobOpts::default()).await.unwrap();
         blob_ids.push(id);
     }
 
@@ -164,7 +164,7 @@ async fn large_blob_is_uploaded_correctly() {
     // 6 MB — triggers multipart upload path.
     let content = vec![0x42u8; 6 * 1024 * 1024];
     let src = temp_file(&dir, "large.bin", &content);
-    let blob_id = engine.put_blob(src, PutBlobOpts::default()).await.unwrap();
+    let blob_id = engine.put_blob(None, src, PutBlobOpts::default()).await.unwrap();
     engine.force_flush_blobs().await.unwrap();
 
     let info = engine.blob_info(&blob_id).await.unwrap().unwrap();
@@ -190,7 +190,7 @@ async fn blob_can_be_associated_with_record() {
         record_id: Some(record_id.clone()),
         collection: Some("papers".into()),
     };
-    let blob_id = engine.put_blob(src, opts).await.unwrap();
+    let blob_id = engine.put_blob(None, src, opts).await.unwrap();
     engine.force_flush_blobs().await.unwrap();
 
     let info = engine.blob_info(&blob_id).await.unwrap().unwrap();
