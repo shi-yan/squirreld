@@ -3,7 +3,10 @@ use std::path::Path;
 use async_trait::async_trait;
 use aws_sdk_s3::{
     Client,
-    types::{CompletedMultipartUpload, CompletedPart},
+    types::{
+        BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
+        CreateBucketConfiguration,
+    },
 };
 
 use crate::backend::{BackendError, BlobBackend, UploadedPart};
@@ -33,13 +36,15 @@ pub enum S3Credentials {
 pub struct S3Backend {
     client:      Client,
     bucket_name: String,
+    region:      String,
 }
 
 impl S3Backend {
     pub async fn new(config: S3Config) -> Result<Self, BackendError> {
+        let region = config.region.clone();
         let sdk_config = build_sdk_config(&config).await?;
         let client = Client::new(&sdk_config);
-        Ok(Self { client, bucket_name: config.bucket_name })
+        Ok(Self { client, bucket_name: config.bucket_name, region })
     }
 }
 
@@ -56,10 +61,21 @@ impl BlobBackend for S3Backend {
             .await;
         if result.is_ok() { return Ok(()); }
 
-        self.client
+        // us-east-1 is S3's default region and must NOT include a
+        // LocationConstraint. All other regions require one.
+        let mut req = self.client
             .create_bucket()
-            .bucket(&self.bucket_name)
-            .send()
+            .bucket(&self.bucket_name);
+
+        if self.region != "us-east-1" {
+            let constraint = BucketLocationConstraint::from(self.region.as_str());
+            let cfg = CreateBucketConfiguration::builder()
+                .location_constraint(constraint)
+                .build();
+            req = req.create_bucket_configuration(cfg);
+        }
+
+        req.send()
             .await
             .map_err(|e| BackendError::Config(e.to_string()))?;
         Ok(())
