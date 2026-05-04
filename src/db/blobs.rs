@@ -59,6 +59,16 @@ pub fn insert(conn: &Connection, row: &BlobRow) -> Result<()> {
     Ok(())
 }
 
+pub fn exists(conn: &Connection, blob_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM blobs WHERE id = ?1",
+        rusqlite::params![blob_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .map_err(Into::into)
+}
+
 pub fn get(conn: &Connection, id: &str) -> Result<Option<BlobRow>> {
     conn.query_row(
         "SELECT id, record_id, collection, local_path, s3_key, size_bytes, upload_id,

@@ -56,6 +56,7 @@ enum Command {
     },
     // ── Blob commands ───────────────────────────────────────────────────────
     PutBlob {
+        id: Option<String>,
         src_path: PathBuf,
         opts: PutBlobOpts,
         reply: oneshot::Sender<Result<BlobId>>,
@@ -260,14 +261,18 @@ impl SquirrelEngine {
     // ── Blob operations ─────────────────────────────────────────────────────
 
     /// Stage a local file as a blob and schedule it for background upload.
+    /// Pass `None` for `id` to generate a ULID, or `Some(key)` for a content-addressed key
+    /// (e.g. `hex::encode(blake3::hash(&bytes))`). If the blob ID already exists the call
+    /// is a no-op and returns the existing ID — safe to call repeatedly for the same content.
     /// Returns the `BlobId`; the actual upload happens asynchronously.
     pub async fn put_blob(
         &self,
+        id: Option<String>,
         src_path: impl Into<PathBuf>,
         opts: PutBlobOpts,
     ) -> Result<BlobId> {
         let (tx, rx) = oneshot::channel();
-        self.send(Command::PutBlob { src_path: src_path.into(), opts, reply: tx }).await?;
+        self.send(Command::PutBlob { id, src_path: src_path.into(), opts, reply: tx }).await?;
         rx.await.map_err(|_| SquirrelError::ActorClosed)?
     }
 
@@ -364,8 +369,8 @@ async fn actor_loop(mut rx: mpsc::Receiver<Command>, mut state: ActorState) {
                 let trigger = state.sync_trigger.clone();
                 let _ = reply.send(force_sync_via(trigger).await);
             }
-            Command::PutBlob { src_path, opts, reply } => {
-                let _ = reply.send(handle_put_blob(&state, src_path, opts));
+            Command::PutBlob { id, src_path, opts, reply } => {
+                let _ = reply.send(handle_put_blob(&state, id, src_path, opts));
             }
             Command::BlobInfo { blob_id, reply } => {
                 let _ = reply.send(handle_blob_info(&state, &blob_id));
@@ -503,12 +508,19 @@ async fn force_sync_via(trigger: Option<mpsc::Sender<SyncTrigger>>) -> Result<Sy
 
 fn handle_put_blob(
     state: &ActorState,
+    id: Option<String>,
     src_path: PathBuf,
     opts: PutBlobOpts,
 ) -> Result<BlobId> {
-    let blob_id = Ulid::new().to_string();
-    let s3_key  = format!("blobs/{blob_id}");
-    let now     = now_ms();
+    let blob_id = id.unwrap_or_else(|| Ulid::new().to_string());
+
+    // Idempotent: if this blob is already staged or uploaded, return immediately.
+    if db::blobs::exists(&state.conn, &blob_id)? {
+        return Ok(blob_id);
+    }
+
+    let s3_key = format!("blobs/{blob_id}");
+    let now    = now_ms();
 
     db::blobs::insert(&state.conn, &db::blobs::BlobRow {
         id:             blob_id.clone(),

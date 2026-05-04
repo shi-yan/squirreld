@@ -304,7 +304,7 @@ async fn blob_uploaded_by_a_accessible_to_b() {
     let pdf = dir_a.path().join("paper.pdf");
     std::fs::write(&pdf, content).unwrap();
 
-    let blob_id = a.put_blob(&pdf, PutBlobOpts::default()).await.unwrap();
+    let blob_id = a.put_blob(None, &pdf, PutBlobOpts::default()).await.unwrap();
     a.force_flush_blobs().await.unwrap();
 
     let info = a.blob_info(&blob_id).await.unwrap().unwrap();
@@ -313,7 +313,7 @@ async fn blob_uploaded_by_a_accessible_to_b() {
     // B stages the same content (in production this would come from synced record metadata).
     let pdf_b = dir_b.path().join("paper_b.pdf");
     std::fs::write(&pdf_b, content).unwrap();
-    let blob_id_b = b.put_blob(&pdf_b, PutBlobOpts::default()).await.unwrap();
+    let blob_id_b = b.put_blob(None, &pdf_b, PutBlobOpts::default()).await.unwrap();
     b.force_flush_blobs().await.unwrap();
 
     let cached = b.get_blob(&blob_id_b).await.unwrap().unwrap();
