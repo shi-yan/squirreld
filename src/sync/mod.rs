@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rusqlite::Connection;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     backend::{OutboxPushEntry, PushResult, RecordBackend, RemoteRecord},
@@ -91,8 +91,15 @@ impl SyncLoop {
                 }
             }
 
+            info!("sync: starting push cycle");
             let push_stats = self.run_push_cycle().await;
+            info!(pushed = push_stats.pushed, conflicts = push_stats.conflicts,
+                  errors = push_stats.errors, "sync: push cycle complete");
+
+            info!("sync: starting pull cycle");
             let pull_stats = self.run_pull_cycle().await;
+            info!(pulled = pull_stats.pulled, errors = pull_stats.errors,
+                  "sync: pull cycle complete");
 
             let combined = SyncStats {
                 pushed:    push_stats.pushed,
@@ -136,7 +143,10 @@ impl SyncLoop {
             // conn dropped here — no borrow crosses an .await
         };
 
-        if push_entries.is_empty() { return stats; }
+        if push_entries.is_empty() {
+            debug!("push: outbox empty, nothing to push");
+            return stats;
+        }
 
         // --- Async network phase + synchronous DB write phase (interleaved per entry) ---
         for entry in &push_entries {
@@ -202,7 +212,10 @@ impl SyncLoop {
                 Err(e) => { warn!("pull: pull_since: {e}"); stats.errors += 1; return stats; }
             };
 
-        if remote_records.is_empty() { return stats; }
+        if remote_records.is_empty() {
+            info!("pull: no new records from remote (checkpoint: {:?})", checkpoint);
+            return stats;
+        }
 
         // --- Synchronous DB write phase ---
         {
