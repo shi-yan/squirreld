@@ -82,6 +82,9 @@ enum Command {
         opts: QueryOpts,
         reply: oneshot::Sender<Result<Vec<RecordMeta>>>,
     },
+    RebuildIndexes {
+        reply: oneshot::Sender<Result<u32>>,
+    },
     Shutdown,
 }
 
@@ -258,6 +261,14 @@ impl SquirrelEngine {
         rx.await.map_err(|_| SquirrelError::ActorClosed)?
     }
 
+    /// Rebuild shadow indexes for all registered collections from the records table.
+    /// Call this after a pull that returned > 0 records to make them visible to queries.
+    pub async fn rebuild_indexes(&self) -> Result<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::RebuildIndexes { reply: tx }).await?;
+        rx.await.map_err(|_| SquirrelError::ActorClosed)?
+    }
+
     // ── Blob operations ─────────────────────────────────────────────────────
 
     /// Stage a local file as a blob and schedule it for background upload.
@@ -387,6 +398,9 @@ async fn actor_loop(mut rx: mpsc::Receiver<Command>, mut state: ActorState) {
             }
             Command::Query { collection, opts, reply } => {
                 let _ = reply.send(handle_query(&state, &collection, opts));
+            }
+            Command::RebuildIndexes { reply } => {
+                let _ = reply.send(handle_rebuild_indexes(&state));
             }
             Command::Shutdown => break,
         }
@@ -670,6 +684,52 @@ fn handle_query(state: &ActorState, collection: &str, opts: QueryOpts) -> Result
     let def = state.indexes.get(collection);
     db::index::query(&state.conn, collection, def, &opts)
         .map(|rows| rows.into_iter().map(to_meta).collect())
+}
+
+fn handle_rebuild_indexes(state: &ActorState) -> Result<u32> {
+    let mut total = 0u32;
+    for (collection, def) in &state.indexes {
+        let rows = db::records::list(
+            &state.conn, collection,
+            None,  // no limit
+            0,     // no offset
+            false, // exclude deleted
+            true,  // ascending
+        )?;
+        for row in rows {
+            let id = row.id.clone();
+            let row = match maybe_decrypt(&state.kek, row) {
+                Ok(r)  => r,
+                Err(e) => { tracing::warn!("rebuild_indexes: decrypt failed for {id}: {e}"); continue; }
+            };
+            let json: serde_json::Value = serde_json::from_slice(&row.data)
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            let mut index_fields = std::collections::HashMap::new();
+            for field_def in &def.fields {
+                let idx_val = match field_def.affinity {
+                    ColumnAffinity::Text    => json.get(&field_def.name)
+                        .and_then(|v| v.as_str())
+                        .map(|s| IndexValue::Text(s.to_string())),
+                    ColumnAffinity::Integer => json.get(&field_def.name)
+                        .and_then(|v| v.as_i64())
+                        .map(IndexValue::Integer),
+                    ColumnAffinity::Real    => json.get(&field_def.name)
+                        .and_then(|v| v.as_f64())
+                        .map(IndexValue::Real),
+                };
+                if let Some(v) = idx_val {
+                    index_fields.insert(field_def.name.clone(), v);
+                }
+            }
+            db::index::upsert_index_row(&state.conn, def, &row.id, &index_fields)?;
+            if !def.fts_fields.is_empty() {
+                db::index::upsert_fts_row(&state.conn, def, &row.id, &index_fields)?;
+            }
+            total += 1;
+        }
+        tracing::info!(collection, rebuilt = total, "rebuild_indexes: collection done");
+    }
+    Ok(total)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
