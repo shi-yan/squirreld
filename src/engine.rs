@@ -72,6 +72,10 @@ enum Command {
     ForceFlushBlobs {
         reply: oneshot::Sender<Result<()>>,
     },
+    RegisterRemoteBlob {
+        blob_id: BlobId,
+        reply:   oneshot::Sender<Result<()>>,
+    },
     // ── Index commands ──────────────────────────────────────────────────────
     RegisterIndex {
         def: IndexDef,
@@ -299,6 +303,14 @@ impl SquirrelEngine {
         rx.await.map_err(|_| SquirrelError::ActorClosed)?
     }
 
+    /// Register a remote blob so the blob worker will download it from S3.
+    /// Inserts a `download_pending` row if unknown, or upgrades `uploaded` → `download_pending`.
+    pub async fn register_remote_blob(&self, blob_id: BlobId) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::RegisterRemoteBlob { blob_id, reply: tx }).await?;
+        rx.await.map_err(|_| SquirrelError::ActorClosed)?
+    }
+
     // ── Index operations ────────────────────────────────────────────────────
 
     /// Register a shadow index for a collection.
@@ -381,6 +393,9 @@ async fn actor_loop(mut rx: mpsc::Receiver<Command>, mut state: ActorState) {
             Command::ForceFlushBlobs { reply } => {
                 let trigger = state.blob_trigger.clone();
                 let _ = reply.send(force_flush_blobs_via(trigger).await);
+            }
+            Command::RegisterRemoteBlob { blob_id, reply } => {
+                let _ = reply.send(handle_register_remote_blob(&state, &blob_id));
             }
             Command::RegisterIndex { def, reply } => {
                 let _ = reply.send(handle_register_index(&mut state, def));
@@ -562,6 +577,12 @@ fn handle_blob_info(state: &ActorState, blob_id: &str) -> Result<Option<BlobInfo
         retries:    r.retries,
         last_error: r.last_error,
     }))
+}
+
+fn handle_register_remote_blob(state: &ActorState, blob_id: &str) -> Result<()> {
+    let s3_key = format!("blobs/{blob_id}");
+    let now = crate::types::now_ms();
+    db::blobs::register_for_download(&state.conn, blob_id, &s3_key, now)
 }
 
 fn handle_get_blob(state: &ActorState, blob_id: &str) -> Result<Option<PathBuf>> {

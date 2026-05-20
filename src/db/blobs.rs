@@ -170,6 +170,18 @@ pub fn mark_retry(conn: &Connection, id: &str, error: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn register_for_download(conn: &Connection, blob_id: &str, s3_key: &str, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO blobs (id, s3_key, status, format_version, retries, next_retry_at, created_at, updated_at)
+         VALUES (?1, ?2, 'download_pending', 0, 0, 0, ?3, ?3)
+         ON CONFLICT(id) DO UPDATE
+           SET status = 'download_pending', updated_at = ?3
+           WHERE status = 'uploaded'",
+        rusqlite::params![blob_id, s3_key, now_ms],
+    )?;
+    Ok(())
+}
+
 // ── Blob parts CRUD ───────────────────────────────────────────────────────────
 
 pub fn upsert_part(
